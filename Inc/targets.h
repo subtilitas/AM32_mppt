@@ -693,6 +693,23 @@
 #define VOLTAGE_ADC_PIN GPIO_PINS_6
 #endif
 
+#ifdef MPPT_F421
+#define FIRMWARE_NAME "AT32PB4_MPPT"
+#define FILE_NAME "MPPT_F421"
+#define DEAD_TIME 60
+#define HARDWARE_GROUP_AT_B
+#define HARDWARE_GROUP_AT_045
+#define USE_SERIAL_TELEMETRY
+// Voltage divider is on PA3, current shunt on PA6. This is the opposite way
+// round to the AT32 dev board target, and matches the MCU_AT421 defaults.
+#define CURRENT_ADC_CHANNEL ADC_CHANNEL_6
+#define CURRENT_ADC_PIN GPIO_PINS_6
+#define VOLTAGE_ADC_CHANNEL ADC_CHANNEL_3
+#define VOLTAGE_ADC_PIN GPIO_PINS_3
+#define ENABLE_MPPT
+#define MPPT_VOLTAGE_OFFSET 6
+#endif
+
 #ifdef ZTW_A_F421
 #define FIRMWARE_NAME "ZTW_A_F421 "
 #define FILE_NAME "ZTW_A_F421"
