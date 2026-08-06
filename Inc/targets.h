@@ -92,12 +92,43 @@
 #define DEAD_TIME 1
 #define HARDWARE_GROUP_L4_B
 #define TARGET_VOLTAGE_DIVIDER 47
-#define MILLIVOLT_PER_AMP 136
+#define MILLIVOLT_PER_AMP 13
 #define CURRENT_OFFSET 2500
 #define USE_SERIAL_TELEMETRY
 #define EEPROM_START_ADD (uint32_t)0x0800F800
-#define ENABLE_MPPT
-#define MPPT_VOLTAGE_OFFSET 6
+/* Solar MPPT tracker - see Inc/mppt.h and doc/MPPT.md.
+ * This is the only target in the tree that enables it; every other board
+ * compiles Src/mppt.c to nothing and is unaffected.
+ *
+ * NOTE ON SCALING: TARGET_VOLTAGE_DIVIDER 47 above means the firmware can
+ * only measure up to 3300 mV * 4.7 = 15.51 V of bus. mppt.h is therefore
+ * scaled for a ~12 V Voc array, NOT the 24 V array the module was written
+ * against. A _Static_assert in mppt.h enforces the relationship.
+ *
+ * THE SAFETY THRESHOLDS BELOW ARE PLACEHOLDERS. Set MPPT_V_COLLAPSE and
+ * MPPT_V_ABSOLUTE_MIN from this board's actual 3.3 V regulator dropout plus
+ * margin before the first flight - with no battery on the bus they are the
+ * only thing keeping the MCU alive. */
+#define USE_MPPT
+
+/* *** THE TRUE SENSE-CHAIN GAIN. ***
+ * MILLIVOLT_PER_AMP above is deliberately mis-set to 13 (real value 136) so
+ * that DShot telemetry, which reports whole amps, shows something other than
+ * 0 on a sub-amp bench panel. That inflates the reported current ~10x. Fine
+ * for a display; wrong for a control loop, whose absolute current thresholds
+ * would then be in fictional amps. The MPPT uses this constant instead, so
+ * the two paths do not have to agree. */
+#define MPPT_MILLIVOLT_PER_AMP 136
+
+/* Array nameplate. Every current-domain threshold derives from Isc, and a
+ * _Static_assert checks the open-circuit threshold stays below it.
+ * Set for the 13.4 V / 120 mA bench panel - CHANGE FOR THE FLIGHT ARRAY. */
+#define MPPT_VOC_NOMINAL      1340    /* 13.40 V Voc at STC, 10 mV       */
+#define MPPT_ARRAY_ISC          12    /*  0.12 A Isc at STC, 10 mA       */
+
+/* Safety thresholds - PLACEHOLDERS, see above. */
+/* #define MPPT_V_COLLAPSE        700 */  /* enter RECOVER, 10 mV         */
+/* #define MPPT_V_ABSOLUTE_MIN    550 */  /* force duty 0, 10 mV          */
 #endif
 
 #ifdef EGAN_JUWI_L431
@@ -106,7 +137,7 @@
 #define DEAD_TIME 1
 #define HARDWARE_GROUP_L4_B
 #define TARGET_VOLTAGE_DIVIDER 47
-#define MILLIVOLT_PER_AMP 136
+#define MILLIVOLT_PER_AMP 14
 #define CURRENT_OFFSET 2500
 #define USE_SERIAL_TELEMETRY
 #define EEPROM_START_ADD (uint32_t)0x0800F800
