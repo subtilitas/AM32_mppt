@@ -10,8 +10,8 @@
 > On a battery that behaviour is wrong in every direction. A battery is a stiff
 > voltage source, so there is no maximum-power point to find; the tracker will
 > read the pack's sag under load as a collapsing panel and throttle back, and
-> the safety thresholds that keep the MCU alive on an unbuffered solar bus will
-> cut power at voltages a normal pack reaches routinely.
+> the safety thresholds that stop an unbuffered solar bus sagging into a
+> brown-out reset will cut power at voltages a normal pack reaches routinely.
 >
 > **Do not flash these binaries onto a battery-powered aircraft, rover or boat.**
 > For normal use, take upstream AM32:
@@ -19,10 +19,12 @@
 
 This is a fork of AM32 for **direct-drive solar aircraft**: PV array → ESC →
 BLDC motor, with **no battery anywhere**. The MCU's own logic supply sits on the
-same bus as the panel, so a bus collapse is a loss of the aircraft — most of the
-design is about preventing that rather than about the last percent of power.
+same bus as the panel. If the bus collapses the ESC browns out and reboots:
+thrust stops until it has restarted, and a receiver sharing the bus may glitch
+too. Recoverable, but not something you want repeatedly — and much of the
+design is about avoiding it rather than about the last percent of power.
 
-## The MPPT tracker
+## How the tracking works
 
 Full detail in [doc/MPPT.md](doc/MPPT.md). In brief:
 
@@ -92,7 +94,7 @@ Only `EGAN_MPPT_L431` has been characterised. For any other board:
 - Set `MPPT_CELLS` and `MPPT_ARRAY_ISC` for your wing.
 - `MPPT_V_REG_MIN` is the one number about the **board**, not the panel: the
   lowest bus voltage at which its 3.3 V rail still regulates. With no battery
-  on the bus it is the last thing between a sagging panel and a dead MCU, and
+  on the bus it sets how far the bus may sag before the ESC resets itself, and
   the 4.30 V default is a guess. **Measure it.**
 - Keep the bus capacitor in roughly 100–1000 µF. 2200 µF is measured unstable.
 

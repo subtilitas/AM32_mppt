@@ -1,5 +1,5 @@
 /*
- * mppt.c - Fast MPPT tracker for AM32 ESC firmware
+ * mppt.c - Maximum power point tracking for AM32 ESC firmware
  * See mppt.h for architecture, references and configuration.
  *
  * ---------------------------------------------------------------------
@@ -846,11 +846,11 @@ void mppt_apply_duty(volatile uint16_t *duty_cycle)
      * This is deliberately outside the state machine. An earlier version
      * returned early when state == OFF, which left AM32's startup ramp
      * completely uncapped: in simulation the bus went to 6.8 V during
-     * spin-up on a cold panel, which on real hardware is a brownout and a
-     * lost aircraft. */
+     * spin-up on a cold panel, which on real hardware means the ESC
+     * brown-out resets before the motor has even spun up. */
     /* Read the ADC register directly rather than mppt.v. mppt.v is the
-     * IIR-filtered value, and that filter's ~3 ms group delay is fatal
-     * here: in simulation the guard fired late enough that the bus reached
+     * IIR-filtered value, and that filter's ~3 ms group delay defeats the
+     * guard: in simulation it fired late enough that the bus reached
      * 9.6 V against an 11.0 V threshold during cold-panel spin-up. The
      * filter exists to give the TRACKER a clean signal; the emergency path
      * wants the freshest number available, noise and all. */

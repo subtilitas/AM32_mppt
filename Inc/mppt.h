@@ -1,10 +1,14 @@
 /*
- * mppt.h - Fast MPPT tracker for AM32 ESC firmware
+ * mppt.h - Maximum power point tracking for AM32 ESC firmware
  *
  * Target      : STM32L431 (Cortex-M4F @ 80 MHz), AM32 v2.x
  * Application : Direct-drive solar aircraft. PV array -> ESC -> BLDC.
- *               NO BATTERY ANYWHERE. The MCU logic supply is on the same
- *               bus as the panel, so bus collapse = loss of control.
+ *               NO BATTERY ANYWHERE. The MCU logic supply shares the bus
+ *               with the panel, so if the bus collapses the ESC browns out
+ *               and reboots: thrust stops for as long as the restart takes,
+ *               and a receiver on the same bus may glitch with it. Both
+ *               recoverable, neither wanted. Avoiding the reset is what the
+ *               safety thresholds below are for.
  *
  * Architecture (cascaded, all integer math, no FPU use):
  *
@@ -157,12 +161,16 @@
 #endif
 
 /* ===================================================================== */
-/*  2. SAFETY THRESHOLDS      *** THESE KEEP THE MCU ALIVE ***           */
+/*  2. SAFETY THRESHOLDS - avoiding a brownout reset                     */
 /* ===================================================================== */
 /*
- * With no battery, if the bus collapses the MCU browns out and you lose
- * the aircraft. MPPT_V_COLLAPSE must sit comfortably above the regulator
- * dropout + the worst-case sag that Cbus can ride through.
+ * With no battery on the bus there is nothing to hold it up when the load
+ * outruns the panel. Let it fall far enough and the MCU browns out, the ESC
+ * reboots, and thrust stops until it has restarted - a few hundred
+ * milliseconds of dead prop, plus a possible receiver glitch if it shares
+ * the bus. Recoverable on a glider-like airframe, but not something to do
+ * repeatedly. MPPT_V_COLLAPSE must sit comfortably above the regulator
+ * dropout plus the worst-case sag Cbus can ride through.
  *
  * Sizing rule of thumb: during a collapse the load pulls I_load and the
  * panel can only supply I_sc. Cbus must hold the bus above the LDO
@@ -179,8 +187,8 @@
  * It is a property of the ESC, not the array, so it does not scale with
  * cell count and it is the hard floor everything else sits above.
  *
- * *** MEASURE IT. *** With no battery on the bus this is the last thing
- * between a sagging panel and a dead MCU. 4.30 V suits a typical 3.3 V LDO;
+ * *** MEASURE IT. *** It sets how far the bus may sag before the ESC
+ * resets. 4.30 V suits a typical 3.3 V LDO;
  * a board with a buck may go lower, one with a high-dropout part may not. */
 #ifndef MPPT_V_REG_MIN
 #define MPPT_V_REG_MIN             430    /*  4.30 V */
@@ -332,8 +340,8 @@
  * AND added a full proportional term (v is at Voc, so the error is large
  * and positive), stepping duty 0 -> 1451 in a single tick. On the 120 mA
  * bench panel that is harmless. On a 3 A array it drew 6.3 A out of Cbus
- * and put the bus on the floor at 4.6 V - a brownout, and with no battery
- * that is the aircraft.
+ * and put the bus on the floor at 4.6 V - well under any 3.3 V regulator,
+ * so the ESC would have reset itself once per sweep.
  *
  * Sizing: the load step has to be slow enough that the panel's own current
  * can rise to meet it as the operating point walks down from Voc to Vmpp.
@@ -356,7 +364,8 @@
  * during a bus collapse dumps the rotor's kinetic energy into the winding
  * resistance as heat, so by the time the bus recovers the motor is slow;
  * low speed means low back-EMF, which means re-applying duty draws a large
- * current surge, which collapses the bus again. That is the limit cycle.
+ * current surge, which collapses the bus again. That is the limit cycle,
+ * and it turns one brief sag into a string of them.
  *
  * Coasting instead is better on both counts. No braking torque, so the
  * prop keeps its energy and its back-EMF. And with all six FETs off the

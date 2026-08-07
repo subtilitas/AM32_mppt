@@ -1,9 +1,12 @@
-# Solar MPPT tracker
+# Maximum power point tracking
 
-Maximum-power-point tracker for direct-drive solar aircraft: PV array → ESC →
-BLDC, **no battery anywhere**. The MCU logic supply sits on the same bus as the
-panel, so a bus collapse is a loss of the aircraft, and most of the design is
-about that rather than about squeezing out the last percent of power.
+For direct-drive solar aircraft: PV array → ESC → BLDC, **no battery
+anywhere**. The MCU logic supply shares the bus with the panel, so if the bus
+collapses the ESC browns out and reboots — thrust stops for as long as the
+restart takes, and a receiver on the same bus may glitch with it. Recoverable
+on a glider-like airframe, but not something you want happening repeatedly,
+and much of the design is about avoiding it rather than about squeezing out
+the last percent of power.
 
 Files: `Src/mppt.c`, `Inc/mppt.h`, regression harness in `test/mppt_sim/`.
 
@@ -37,7 +40,7 @@ Three call sites, no deletions.
 | Location | Call | Why there |
 |---|---|---|
 | `Src/main.c` includes | `#include "mppt.h"` | Must follow `targets.h`, which is where `USE_MPPT` comes from |
-| End of `main()`, just before `while (1)` | `mppt_init()` | ADC DMA has been running through the whole startup tune, so `ADC_raw_volts` is live. Note init does *not* sample Voc — see §3.3 |
+| End of `main()`, just before `while (1)` | `mppt_init()` | ADC DMA has been running through the whole startup tune, so `ADC_raw_volts` is live. Note init does *not* sample Voc — see §3.4 |
 | End of the 1 kHz block in `tenKhzRoutine()` | `mppt_1khz_update()` | Sees the settled results of AM32's current-limit / stall / speed loops |
 | In `tenKhzRoutine()`, after `last_duty_cycle = duty_cycle` | `mppt_apply_duty(&duty_cycle)` | **After** the ramp/slew block and **after** the ramp state is captured |
 
@@ -156,9 +159,9 @@ and is the better fallback if you can tolerate its dither.
 
 **Calibration — two numbers.** `MPPT_CELLS` and `MPPT_ARRAY_ISC`. Everything
 else derives: Voc, Vmpp, the ratio between them, the diode voltage, both
-safety thresholds, and β's own target. See §3.4.
+safety thresholds, and β's own target. See §3.3.
 
-### 3.4 Describing the array
+### 3.3 Describing the array
 
 A typical RC solar wing is 10–16 SunPower back-contact cells in series, and
 those cells are consistent enough that one number fixes the rest:
@@ -212,7 +215,7 @@ Measured against a SunPower plant model, 60 s, β with its derived target:
 |---|---|---|---|---|---|
 | tracking | 99.98% | 99.97% | 99.93% | 99.99% | 99.98% |
 
-### 3.3 Voc measurement
+### 3.4 Voc measurement
 
 1. **At boot, deferred** — the bus at power-up is Voc, but only once nothing
    is loading it. `mppt_init()` deliberately does *not* sample: AM32 plays its
@@ -538,8 +541,8 @@ These are **not** fixed. They need hardware, not more simulation.
 1. **The two safety thresholds are placeholders.** `MPPT_V_COLLAPSE 700` and
    `MPPT_V_ABSOLUTE_MIN 550` were chosen to be self-consistent with a 12 V
    array, *not* from this board's 3.3 V regulator dropout. With no battery on
-   the bus they are the only thing keeping the MCU alive. Measure the dropout,
-   add margin, set them, and size Cbus from:
+   the bus they are what stops it sagging into a brown-out reset. Measure the
+   regulator's dropout, add margin, set them, and size Cbus from:
 
    ```
    Cbus >= (I_load - I_sc) * MPPT_RECOVER_MS / (V_collapse - V_dropout)
