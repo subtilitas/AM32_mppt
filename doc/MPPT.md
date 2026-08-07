@@ -37,7 +37,7 @@ Three call sites, no deletions.
 | Location | Call | Why there |
 |---|---|---|
 | `Src/main.c` includes | `#include "mppt.h"` | Must follow `targets.h`, which is where `USE_MPPT` comes from |
-| End of `main()`, just before `while (1)` | `mppt_init()` | ADC DMA has been running through the whole startup tune, so `ADC_raw_volts` is live; duty is still 0 and the panel is open-circuit, which hands init a real Voc measurement for free |
+| End of `main()`, just before `while (1)` | `mppt_init()` | ADC DMA has been running through the whole startup tune, so `ADC_raw_volts` is live. Note init does *not* sample Voc — see §3.3 |
 | End of the 1 kHz block in `tenKhzRoutine()` | `mppt_1khz_update()` | Sees the settled results of AM32's current-limit / stall / speed loops |
 | In `tenKhzRoutine()`, after `last_duty_cycle = duty_cycle` | `mppt_apply_duty(&duty_cycle)` | **After** the ramp/slew block and **after** the ramp state is captured |
 
@@ -65,76 +65,102 @@ see §6.6.
 | State | Meaning |
 |---|---|
 | `OFF` | Disarmed / not running. A conservative duty ceiling still applies |
-| `SEED` | Jumped to 0.78 × Voc, letting the inner PI settle |
-| `TRACK` | Normal tracking — see the two modes below |
+| `SEED` | Jumped to `k × Voc`, letting the inner PI settle |
+| `TRACK` | Normal tracking — the β regulator, §3.2 |
 | `RECOVER` | Bus collapse — shedding load. Safety path |
-| `VOC` | Duty 0, measuring true open-circuit voltage |
 
-`mppt.state`, `mppt.vref`, `mppt.voc_est`, `mppt.duty_applied`,
-`mppt.hill_climb`, `mppt.collapse_events`, `mppt.reseed_events` and
-`mppt.voc_sweeps` are all safe to stream over AM32's serial telemetry while
+`mppt.state`, `mppt.vref`, `mppt.voc_est`, `mppt.voc_boot`, `mppt.duty_applied`,
+`mppt.beta`, `mppt.beta_trim`, `mppt.beta_valid`, `mppt.i_zero_raw`,
+`mppt.collapse_events` and `mppt.coast_events` are all safe to stream over AM32's serial telemetry while
 commissioning.
 
-### 3.1 Two tracking modes, chosen automatically
+### 3.1 Tracking modes
 
-`TRACK` runs one of two things depending on whether the current channel
-carries usable information:
+Two trackers, one compiled in per board, selected by `MPPT_TRACKER`:
 
-- **Fractional-Voc + rpm feedback** (`mppt.hill_climb == 0`) —
-  `vref = k × voc_est`, with the inner PI regulating to it fast and `k`
-  adapted slowly from rotor speed. Needs no current measurement at all.
-  See §3.3.
-- **Hill-climbing** (`mppt.hill_climb == 1`) — dP/dV incremental conductance
-  with the two-step escalation, as originally designed.
+| `MPPT_TRACKER` | Objective | Needs current? | Steady state |
+|---|---|---|---|
+| `MPPT_TRACKER_BETA` (default) | `β = ln(I/V) − c·V` regulated to its MPP value | **yes**, absolute | 0.000 V p-p |
+| `MPPT_TRACKER_RPM` | P&O on `e_com_time`, adapting `k` | no | dithers ±0.21 V |
 
-The switch is `mppt.i >= MPPT_TRACK_I_MIN`, derived from
-`MPPT_TRACK_MIN_COUNTS` ADC counts rather than an absolute current, so it
-follows the sense chain automatically. Force one mode with `MPPT_MODE`.
+**Which board gets which is not a compiler decision.** `Inc/targets.h` ends
+with `#ifndef MILLIVOLT_PER_AMP / #define MILLIVOLT_PER_AMP 20`, so a board
+with no shunt still reports a current — a fabricated one — and the
+preprocessor cannot tell it from a board that genuinely chose 20 mV/A.
+136 of 254 board blocks are in that position. β drives the setpoint from
+`ln(I/V)` and does not degrade gracefully on an invented current: it walks
+`vref` into a clamp rail.
 
-Why bother: on a 13.4 V / 120 mA panel the whole array spans 20 ADC counts,
-and *every* tuning of the hill-climber topped out at 86.6% while plain
-fractional-Voc held 96.8% dead flat. Above roughly 125 counts of operating
-current, hill-climbing is the better of the two and takes over.
+So `test/mppt_targets.sh` parses `targets.h` and asks whether the board's
+*own* block defines `MILLIVOLT_PER_AMP`. 112 boards get β; 136 get the rpm
+fallback. A board block may pin `MPPT_TRACKER` explicitly.
 
-### 3.3 RPM feedback — how `k` finds the real MPP
+One further algorithm was implemented, measured and removed: dP/dV
+incremental conductance with Hassani two-step escalation, ~86%. It infers
+`dP/dV` from a *difference* of currents, and ~20 ADC counts makes that
+quantisation noise. See §6.4.
 
-Fractional-Voc is open-loop on a constant, and the constant is usually wrong.
-The textbook 0.781 put the setpoint at 10.47 V on the bench panel against a
-true Vmpp of 11.32 V.
+**There is deliberately no "small array" versus "large array" split.** An
+earlier version gated the algorithm on measured current, assuming those were
+two different cases. They are not: a large array in low light draws the same
+handful of ADC counts as a small array in full sun, so the gate did not
+separate two kinds of hardware — it just flipped algorithms as the weather
+changed, and into the worse one whenever the sun came out. Irradiance is the
+axis that matters, and the harness varies that (`G=` in `run.sh`) rather than
+swapping panel presets.
 
-Hill-climbing on measured *power* is not available here — 120 mA spans 20 ADC
-counts, so dP is mostly quantisation. But the ESC has a much better signal
-sitting unused: `e_com_time`, the electrical revolution period, is ~0.5% of
-speed per LSB at 44–47 krpm, about ten times finer than one current count, and
-averages over hundreds of revolutions.
+### 3.2 The beta method
 
-For a fixed-pitch prop, load torque goes as ω² so shaft power goes as ω³, and
-**maximum rpm is maximum shaft power**. On an aircraft that is not a proxy for
-the objective, it *is* the objective — and it absorbs motor efficiency
-variation, which panel-power MPPT ignores by construction. Note the sensitivity
-that follows from the cube law: 44 krpm → 47 krpm is 6.8% in speed but **22% in
-shaft power**.
+Fractional-Voc is open-loop on a constant, and the constant is usually
+wrong — the textbook 0.781 put the setpoint at 10.47 V on the bench panel
+against a true Vmpp of 11.32 V. Hill-climbing fixes that but oscillates by
+construction, which is what the rpm tracker did: ±0.21 V on `vref` and
+±0.60 V on the bus, forever.
 
-So: perturb `k`, wait out the prop's mechanical time constant, average the
-period, keep the direction if rpm improved and reverse if it did not. A tie
-also reverses, which makes it dither one step either side of the peak instead
-of drifting off it.
+Beta is neither. Define
 
-What is adapted is the *ratio*, not a voltage offset. The FOCV error is
-`(k_true − k₀) × Voc`, which scales with Voc, so correcting `k` stays right as
-irradiance and temperature move Voc; a fixed voltage trim would not.
+    β = ln(I/V) − c·V,     c = 1/Vt
 
-Guards: throttle must hold still across a whole cycle, the motor must be spun
-up, `e_com_time` must not be the 65408 pre-spin-up sentinel, and the PI must
-have authority — if duty is railed, `vref` is not setting the operating point
-and rpm says nothing about `k`. `k` is clamped to `MPPT_K_MIN_Q8`…`MPPT_K_MAX_Q8`
-so no amount of bad rpm data can walk the setpoint anywhere dangerous.
+β evaluated at the MPP is very nearly independent of irradiance, so rather
+than searching for the peak you compute β from the present operating point
+and drive `vref` until it matches the known MPP value. Measured on one panel:
 
-Measured on the bench panel, 40 s: `k` 200 → 216, rpm 1532 → 1548,
-**96.75% → 99.64%**. `k` is not stored in EEPROM; it re-learns in ~10 s of
-steady throttle.
+| irradiance | β at MPP | tracking |
+|---|---|---|
+| 100% | −5022 | 99.90% |
+| 60% | −5022 | 99.88% |
+| 35% | −5023 | 99.71% |
 
-### 3.2 Voc measurement
+That invariance — three parts in ten thousand across a 3:1 irradiance range
+— is the whole reason to use it.
+
+**Why not plain incremental conductance.** True INC solves `dI/dV = −I/V`,
+which needs a *difference* of currents. On an array spanning 20 ADC counts
+that difference is quantisation noise. β needs only *absolute* I and V, and
+is dominated by the voltage term:
+
+    dβ/dV = −1/V − c ≈ −0.09 − 1.33 = −1.42 per volt
+
+so the precisely-measured `c·V` term carries the sensitivity while the noisy
+`ln(I)` term contributes weakly. A 5% error in I moves the setpoint 36 mV.
+
+**Steady-state movement:** 0.000 V peak-to-peak on both `vref` and the bus,
+against 0.210 V / 0.596 V for the rpm tracker.
+
+**The floor.** Below about 25% irradiance the current reading falls under two
+ADC counts, β stops being computable, and the code falls back to plain
+fractional-Voc while *holding* the trim it last learned (verified: the trim
+survives a cloud edge unchanged). That floor is a property of the sense
+chain, not the algorithm. See the crossover table in §7 item 7 — the rpm tracker still works down there
+and is the better fallback if you can tolerate its dither.
+
+**Calibration.** Two panel constants: `MPPT_BETA_VT` and
+`MPPT_BETA_MPP_Q8`, plus `MPPT_K_FOCV_Q8` for the seed and low-light
+fallback. To set the latter, find the best operating point by hand
+and read `mppt.beta` off telemetry. It is one reading and does not need
+repeating per irradiance.
+
+### 3.3 Voc measurement
 
 1. **At boot, deferred** — the bus at power-up is Voc, but only once nothing
    is loading it. `mppt_init()` deliberately does *not* sample: AM32 plays its
@@ -143,7 +169,7 @@ steady throttle.
    waits for a quiet window — no tone pending, no current, no applied duty,
    and the bus voltage stationary for `MPPT_BOOT_VOC_SETTLE_MS` (300 ms).
    "Stationary" is measured against the voltage at the *start* of the window,
-   not tick to tick; see §6.14. It keeps retrying, so arming early only delays
+   not tick to tick; see §6.12. It keeps retrying, so arming early only delays
    the capture rather than losing it. Result lands in `mppt.voc_boot`.
 2. **Opportunistic** — when current is below `MPPT_VOC_I_TH` **and**
    `duty_applied` is below `MPPT_VOC_DUTY_TH`, IIR `voc_est` toward the
@@ -152,9 +178,9 @@ steady throttle.
    13.39 V through a loaded run, and converges to 13.36 V against a true
    13.40 V within a 2 s throttle chop.
 
-There is also a **periodic duty-0 sweep**, and it is **disabled by default**.
-Do not enable it without reading §6.9 — on this hardware duty 0 is a brake,
-not a coast.
+A periodic duty-0 Voc sweep was also implemented and **removed**: on this
+hardware duty 0 is a brake, not a coast, so it braked the motor once per
+interval. See §6.8.
 
 `MPPT_VOC_NOMINAL` is only a fallback for the window before the first real
 measurement.
@@ -163,10 +189,12 @@ measurement.
 
 ## 4. Cost on EGAN_MPPT_L431
 
-- **RAM:** 104 bytes (`mppt_t`) + 4 static bytes.
-- **Flash:** ~2.5 kB (measured 3564 B of x86-64 `.text`; Thumb-2 is smaller).
+- **RAM:** 87 bytes total (`mppt_t` plus 3 static bytes).
+- **Flash:** ~3.2 kB (measured 3312 B of x86-64 `.text`; Thumb-2 is smaller).
 - **CPU:** every division is by a compile-time constant and gets
-  strength-reduced to multiply-high-plus-shift. Roughly 1% of an 80 MHz
+  strength-reduced to multiply-high-plus-shift. The only notable cost is an
+  integer `ln` (CLZ plus a 17-entry interpolated table, ~20 cycles, no libm)
+  twice per β update, and β updates at ~48 Hz. Well under 1% of an 80 MHz
   Cortex-M4. **Measure it** with a GPIO toggle before relying on that.
 - No FPU use, no `float`, no `double`, no dynamic allocation.
 
@@ -174,25 +202,26 @@ measurement.
 
 ## 5. Verification status
 
-Run the harness with `test/mppt_sim/run.sh [seconds]`. It compiles the
-**shipping** `Src/mppt.c` — no stubbed algorithm — against a PV +
-bus-capacitor + BLDC + propeller plant, pulling every board constant from the
-real `Inc/targets.h`.
+Run the harness with `test/mppt_sim/run.sh [seconds]`, and `G=0.35 ./run.sh`
+for reduced irradiance. It compiles the **shipping** `Src/mppt.c` — no stubbed
+algorithm — against a PV + bus-capacitor + BLDC + propeller plant, pulling
+every board constant from the real `Inc/targets.h`.
 
-Two array scales are covered, because the failure modes are completely
-different at each and each one hid a bug the other could not show.
+One panel, with irradiance as the variable. There is no separate "small array"
+case: in low light a large array draws the same few ADC counts as a small one
+in full sun.
 
 | Test | Result |
 |---|---|
-| `ARRAY=flight` (12 V / 3 A), 3.4 s bank + cloud profile | 96.72%, 0 brownouts, 0 collapses |
-| `ARRAY=flight`, 60 s soak | 97.01%, 0 brownouts |
-| `ARRAY=bench` (13.4 V / 120 mA), 4 s | 97.39% — rpm tracker has not converged yet |
-| `ARRAY=bench`, 60 s soak | **99.71%**, k converged 200 → 216 |
-| rpm tracker disabled, same run | 96.75% — the 3% is what the tracker buys |
-| Steady rpm vs fixed k, 196…228 | peak at k=216, matches where the tracker lands |
-| Throttle chop, Voc recovery | `voc_est` 13.36 V vs true 13.40 V, no corruption under load |
-| `run.sh coast` — directed tests: coast/unload, boot Voc, rpm guards, 29 assertions | all pass, under UBSan/ASan |
-| Cbus 100 µF … 1000 µF, flight scale | 95.8% throughout, 0 brownouts |
+| β, full sun, 60 s | 99.91%, 0 brownouts, `vref` 0.000 V p-p |
+| β at 60% / 35% irradiance | 99.89% / 99.72% |
+| β below 25% irradiance | drops out, falls back to fixed-k holding its trim — see §7 item 7 |
+| rpm P&O, same runs | 99.64% / 99.29% / 98.30%, but 0.210 V p-p dither |
+| fixed k=0.781, same runs | 96.74% / 92.49% / 89.95% |
+| β target constant across 3:1 irradiance | −5022 / −5022 / −5023 |
+| Integer `ln` vs libm, x = 1…100000 | max error 0.011 → 7.6 mV of setpoint |
+| Sun → deep shade → sun | trim held through the cloud, resumes on return |
+| Cbus 100 µF … 1000 µF | 0 brownouts |
 | Cbus 2200 µF | **fails** — 1 collapse, −1.32 A regeneration |
 | `-fsanitize=undefined,address` | clean |
 | `-Wall -Wundef -Wextra -Werror` (AM32's own flags) | clean, module and call sites |
@@ -268,7 +297,6 @@ the end of the header refuses to compile a configuration where:
 - `MPPT_V_ABSOLUTE_MIN` ≥ `MPPT_V_COLLAPSE`
 - the collapse threshold leaves no usable vref band below Voc
 - the fractional-Voc seed sits below the collapse threshold
-- `MPPT_AVG_TICKS` is outside `1..MPPT_PERIOD_TICKS`
 - the tick rate falls below 500 Hz
 - a recover timeout rounds to zero ticks
 - `duty_q12 * MPPT_RECOVER_DECAY_Q8` would overflow int32
@@ -285,13 +313,13 @@ deadband of 50 mW. The tracker was reversing direction on quantisation.
 
 Three things came out of it:
 
-- `MPPT_DP_QUANT_MULT` — the power deadband now has a runtime floor of
-  `3 × v × I_LSB`, computed from the live voltage. This alone took the bench
-  panel from 77.6% to 90.7%.
-- `MPPT_TRACK_MIN_COUNTS` — below 125 counts of operating current the module
-  runs fractional-Voc instead of hill-climbing. 96.8% instead of 86.6%.
-- `MPPT_ARRAY_ISC` — the array nameplate is now a declared input, and every
+- A runtime quantisation floor on the power deadband (`3 × v × I_LSB`) took
+  the panel from 77.6% to 90.7%.
+- Falling back from hill-climbing to fractional-Voc took it to 96.8%.
+- `MPPT_ARRAY_ISC` — the array nameplate is a declared input, and every
   current-domain threshold derives from it with static assertions.
+
+The hill-climber itself was later removed outright; β superseded both fixes.
 
 ### 6.5 `MPPT_VOC_I_TH` above the array's own Isc
 
@@ -332,7 +360,7 @@ cannot put a control loop's thresholds into fictional amps.
 The sim harness models this properly: `HW_MVA` is the hardware, targets.h is
 the firmware's belief, and they are allowed to disagree.
 
-### 6.9 The Voc sweep was braking the motor
+### 6.8 The Voc sweep was braking the motor
 
 Symptom on hardware: hard stutter every interval, the motor audibly and
 physically braked rather than coasting.
@@ -355,7 +383,7 @@ knife-edge — 78% at 15 ticks, 98.7% at 25, 93% at 40, and 88.6% / 98.7% /
 80.6% across Cbus 100 µF / 470 µF / 1000 µF. Fractional-Voc holds 96.8% flat
 across all of it. Not adopted.
 
-### 6.10 Opportunistic Voc gated on the wrong duty
+### 6.9 Opportunistic Voc gated on the wrong duty
 
 The estimator tested `mppt.duty`, which in the gated state is deliberately set
 to a conservative *ceiling* of `MPPT_STARTUP_DUTY_MAX` (400) rather than to
@@ -366,9 +394,9 @@ now tests `mppt.duty_applied`, the value actually handed to the PWM.
 `voc_est` is also now clamped to `MPPT_ADC_FULL_SCALE_V` — no estimate above
 what the divider can measure.
 
-### 6.12 The undervoltage cut was braking too
+### 6.10 The undervoltage cut was braking too
 
-Same root cause as §6.9, on the path where it matters most. `mppt_apply_duty()`
+Same root cause as §6.8, on the path where it matters most. `mppt_apply_duty()`
 set `*duty_cycle = 0` for the `MPPT_V_ABSOLUTE_MIN` cut, and the tail of the
 `RECOVER` exponential decay reached ~0 as well — both of which short the
 winding through the low-side FETs.
@@ -393,7 +421,7 @@ Two things this cost getting right:
   disturbed start.
 - **The hard cut needed its own `allOff()`.** That branch returns early, before
   the shared one, so it was setting the coast flag and then leaving the winding
-  shorted anyway. Caught by `test_coast.c`, not by the plant model.
+  shorted anyway. Caught by `test_directed.c`, not by the plant model.
 
 Note the threshold matters for a physical reason: above roughly 2% duty the
 complementary FETs are doing useful synchronous rectification and feeding the
@@ -401,7 +429,7 @@ collapsing bus. It is only at genuinely zero duty that the winding is a dead
 short and the rotor's energy goes to heat for no return. Coasting earlier than
 that would give away real energy.
 
-### 6.13 The rpm tracker stalled short of the peak
+### 6.11 The rpm tracker stalled short of the peak
 
 First cut used `MPPT_K_STEP_Q8 = 1`. Near the peak the P–V curve is flat, so a
 one-unit step changed rpm by 0.055% against a 0.1% deadband — every comparison
@@ -423,7 +451,7 @@ Dropping the deadband to zero also converges, but only because the sim has no
 rpm noise; the deadband is what makes it survive real jitter. Raising the step
 is the robust fix.
 
-### 6.14 Boot-Voc "settled" test defeated by a slow ramp
+### 6.12 Boot-Voc "settled" test defeated by a slow ramp
 
 The settle test originally compared `v` against the *previous tick*. A slow
 steady ramp whose per-tick step sits just under the threshold passes that test
@@ -435,14 +463,14 @@ drift to `MPPT_BOOT_VOC_STABLE_DV` (0.10 V) across the whole 300 ms. Caught by
 a directed test using a deliberately slow ramp; a fast ramp passes either
 version and would have hidden it.
 
-### 6.15 `reg_ticks` never incremented in FOCV mode
+### 6.13 `reg_ticks` never incremented in FOCV mode
 
 The "does the PI have authority?" counter was updated *after* the
 fractional-Voc branch, which breaks out early. So in FOCV mode it stayed pinned
 at 0 — and the rpm tracker gates on it, so the tracker would never have run at
 all. Moved above the branch.
 
-### 6.16 Dead code
+### 6.14 Removed outright
 
 `MPPT_REG_BAND` was defined and never used — the "does the PI have authority?"
 gate is implemented purely as a duty-rail check. Removed. The `duty_applied`
@@ -465,18 +493,17 @@ These are **not** fixed. They need hardware, not more simulation.
    Cbus >= (I_load - I_sc) * MPPT_RECOVER_MS / (V_collapse - V_dropout)
    ```
 
-2. **`MPPT_ARRAY_ISC` is set for the bench panel, not the flight array.**
-   `Inc/targets.h` declares 0.12 A. Change it — and `MPPT_VOC_NOMINAL` — when
-   the real array goes on, or the module will stay in fractional-Voc mode and
-   leave a couple of percent on the table. `ARRAY=flight ./test/mppt_sim/run.sh`
-   exercises the hill-climb path in the meantime.
+2. **`MPPT_BETA_MPP_Q8` and `MPPT_BETA_VT` are panel constants.** They are
+   set for the 13.4 V / 120 mA panel. They do not need re-measuring per
+   irradiance — that invariance is the point — but they *are* specific to a
+   panel. Fit a different array and re-read `mppt.beta` at its best hand-found
+   operating point. Pointing one panel's constant at another gives ~50%.
 
-3. **Zero-current calibration is unverified.** With `CURRENT_OFFSET 2500` and
-   the true 136 mV/A, 1 mV of sense-amp offset drift moves the reading ~7.4 mA.
-   `MPPT_VOC_I_TH` is now 20 mA on this board, which is under three ADC counts.
-   Log the reading at true zero current and confirm it settles below that. The
-   periodic sweep is the primary Voc source so this is no longer load-bearing,
-   but it is still worth knowing.
+3. **The current-sense zero is now self-calibrated, but only at boot.** It is
+   captured in the quiet window and held for the flight, so thermal drift of
+   the sense amp is uncorrected. β tolerates about ±2 mV and rails past ±5 mV
+   — and on this chain 1 mV is 7.4 mA, 6% of the array. Watch `mppt.i_zero_raw`
+   against a cold and a warm board before trusting a long flight.
 
 4. **`voc_est` only moves when the throttle comes down.** With the periodic
    sweep disabled, the estimate is refreshed at boot and at every throttle
@@ -495,7 +522,24 @@ These are **not** fixed. They need hardware, not more simulation.
 6. **`MPPT_VOLTAGE_OFFSET 6`** in the `EGAN_MPPT_L431` block is referenced
    nowhere in the tree. Left in place, but it does nothing.
 
-7. **Right shifts of negative values.** The IIR filters rely on `>>` being
+7. **β dies below ~25% irradiance, and the rpm tracker does not.** Measured
+   over 60 s on one panel:
+
+   | irradiance | β | rpm P&O | fixed k |
+   |---|---|---|---|
+   | 100% | **99.91%** | 99.64% | 96.74% |
+   | 60% | **99.89%** | 99.29% | 92.49% |
+   | 35% | **99.72%** | 98.30% | 89.95% |
+   | 20% | 87.35% | **97.56%** | 87.35% |
+   | 10% | 88.87% | **98.62%** | 88.87% |
+
+   The crossover is where current falls under two ADC counts. β then falls
+   back to fixed-k, which costs ~10%. The rpm tracker keeps working down
+   there because it never needed current at all — at the price of the
+   ±0.21 V dither. Using the rpm tracker as the low-light fallback instead
+   of fixed-k is the obvious improvement and is not implemented.
+
+8. **Right shifts of negative values.** The IIR filters rely on `>>` being
    arithmetic, which GCC guarantees but ISO C does not. It also biases the
    filter output low by under 40 mV / 40 mA. Harmless, but do not "clean up"
    the shifts into divisions without re-checking the tuning.

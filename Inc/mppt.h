@@ -9,14 +9,18 @@
  * Architecture (cascaded, all integer math, no FPU use):
  *
  *   tenKhzRoutine()          10/20 kHz   duty application + collapse clamp
- *     +-- 1 kHz block        ~1 kHz      sample, filter, PI voltage loop
- *           +-- tracker      ~200 Hz     dP/dV incremental conductance
- *                                        with Hassani two-step escalation
+ *     +-- 1 kHz block        ~950 Hz     sample, filter, PI voltage loop
+ *           +-- tracker      ~48 Hz      beta = ln(I/V) - c*V, regulated
  *
- * The inner PI drives duty cycle to hold the PANEL voltage at vref.
- * The outer tracker moves vref. Decoupling this way lets the tracker run
- * ~200 Hz instead of being stuck behind the propeller's ~0.5-2 s
- * mechanical time constant.
+ * The inner PI drives duty cycle to hold the PANEL voltage at vref. The
+ * outer tracker moves vref. Decoupling this way keeps the fast loop clear
+ * of the propeller's 0.5-2 s mechanical time constant.
+ *
+ * The outer loop is a REGULATOR, not a hill-climber: it computes where the
+ * MPP is from the present operating point rather than searching for it, so
+ * there is no perturbation and no steady-state dither. See the note at the
+ * top of mppt.c for the three hill-climbing approaches that were tried and
+ * removed, and why.
  *
  * ---------------------------------------------------------------------
  * ENABLING
@@ -30,17 +34,12 @@
  * itself for safety; targets.h is pure macros and is safe to re-include.
  *
  * References:
- *  [1] Hassani, Maamoun, Tadrist, Nesba, "A New High Speed and Accurate
- *      FPGA-based MPPT Method for Photovoltaic Systems", IJPEDS Vol.8 No.3,
- *      2017. -> the two-step (DminStep/DmaxStep) automatic switcher.
- *  [2] Microchip AN1521, "Practical Guide to Implementing Solar Panel MPPT
- *      Algorithms". -> 1 kHz PI inner loop, MPPT_AVERAGE sample averaging,
- *      and the finding that the dI/dV form of incr. conductance is too
- *      noise-sensitive on real hardware while the dP/dV form works.
- *  [3] TI TIDA-010042, 400-W GaN MPPT Charge Controller Reference Design.
+ *  [1] Microchip AN1521, "Practical Guide to Implementing Solar Panel MPPT
+ *      Algorithms". -> the 1 kHz PI inner loop.
+ *  [2] TI TIDA-010042, 400-W GaN MPPT Charge Controller Reference Design.
  *      -> "when Vpanel is within 97.5%-102.5% of Vmpp, the output power of
- *      the panel is above 99.5% of maximum power". This is why the
- *      deadbands below are deliberately generous.
+ *      the panel is above 99.5% of maximum power" - why a small residual
+ *      setpoint error costs almost nothing.
  */
 
 #pragma once
@@ -82,14 +81,15 @@
 #endif
 
 /* Vmpp/Voc ratio, Q8 (value/256). Crystalline silicon is 0.76-0.80.
- * 200/256 = 0.781. This is the STARTING value only - see the rpm tracker in
- * section 6b, which adapts it in flight. It still sets where the tracker
- * begins, so a good guess converges faster.
+ * 200/256 = 0.781.
  *
- * Be aware that 0.781 is a textbook figure and real panels vary widely. For
- * the single-diode model of the 13.4 V / 120 mA bench panel the true ratio
- * is 0.845, and running at 0.781 puts the setpoint at 10.47 V against a
- * Vmpp of 11.32 V. That is the error the rpm tracker exists to remove. */
+ * This is the SKELETON, not the answer: it sets the seed at startup and the
+ * fallback when the current reading is too small for beta to work. Beta
+ * trims around it. A good value still helps but is no longer critical.
+ *
+ * 0.781 is a textbook figure and real panels vary widely - for this panel
+ * the true ratio is 0.845, so 0.781 alone would sit at 10.47 V against a
+ * Vmpp of 11.32 V. That is the error beta removes. */
 #ifndef MPPT_K_FOCV_Q8
 #define MPPT_K_FOCV_Q8            200
 #endif
@@ -183,22 +183,6 @@
 #define MPPT_MS_TO_TICKS(ms)  (((ms) * MPPT_TICK_HZ + 500) / 1000)
 #define MPPT_RECOVER_TICKS    MPPT_MS_TO_TICKS(MPPT_RECOVER_MS)
 #define MPPT_RECOVER_OK_TICKS MPPT_MS_TO_TICKS(MPPT_RECOVER_OK_MS)
-
-/* Tracker decision period, in control ticks.
- *   5 -> ~190 Hz tracker at a 952 Hz tick.
- * Lower is faster but the inner PI must have settled. Do not set below
- * the inner loop's ~2% settling time (see tuning notes in mppt.c). */
-#ifndef MPPT_PERIOD_TICKS
-#define MPPT_PERIOD_TICKS            5
-#endif
-
-/* Number of ticks averaged immediately BEFORE each decision. Per AN1521,
- * the samples right after a perturbation contain the settling transient
- * and must be discarded; only the last MPPT_AVG_TICKS are used.
- * Must be >= 1 and <= MPPT_PERIOD_TICKS. */
-#ifndef MPPT_AVG_TICKS
-#define MPPT_AVG_TICKS               2
-#endif
 
 /* ===================================================================== */
 /*  4. INPUT FILTERING                                                   */
@@ -324,9 +308,6 @@
  * applied duty, so this never interferes with AM32's idle/brake_on_stop
  * behaviour when the pilot simply closes the throttle.
  * ------------------------------------------------------------------- */
-#ifndef MPPT_COAST_ENABLE
-#define MPPT_COAST_ENABLE            1
-#endif
 #ifndef MPPT_COAST_DUTY_TH
 #define MPPT_COAST_DUTY_TH          40    /* enter coast below 2% demand */
 #endif
@@ -335,10 +316,6 @@
 #endif
 _Static_assert(MPPT_COAST_EXIT_DUTY > MPPT_COAST_DUTY_TH,
     "coast thresholds need hysteresis or the output stage will chatter");
-
-/* ---- tracker slot phases (see mppt.c) ---- */
-#define MPPT_PHASE_DRIFT             0
-#define MPPT_PHASE_RESPONSE          1
 
 /* ---- "does the PI have authority?" gate ----
  * The tracker's whole premise is that a change in power was caused by its
@@ -357,117 +334,199 @@ _Static_assert(MPPT_COAST_EXIT_DUTY > MPPT_COAST_DUTY_TH,
 #endif
 
 /* ===================================================================== */
-/*  6. TRACKER (dP/dV incremental conductance + two-step escalation)     */
+
 /* ===================================================================== */
-
-/* Perturbation steps applied to vref, in 10 mV.
- * MPPT_STEP_MIN sets the steady-state ripple around the MPP.
- * Per TI [3], +-2.5% of Vmpp still yields >99.5% of available power, so
- * for a 12 V array (Vmpp ~9.4 V) anything under ~235 (2.35 V) is "free".
- * We use far less than that; the limit is really ADC noise. */
-#ifndef MPPT_STEP_MIN
-#define MPPT_STEP_MIN                8    /* 0.08 V */
-#endif
-#ifndef MPPT_STEP_MAX
-#define MPPT_STEP_MAX               40    /* 0.40 V */
-#endif
-
-/* Hassani two-step switcher [1]: after this many consecutive
- * same-direction MIN steps, escalate to MAX. Any direction reversal drops
- * straight back to MIN. Counter-based and therefore SCALE-FREE - it works
- * identically at 5 W and at 50 W, which matters when a banking wing swings
- * irradiance 10:1. */
-#ifndef MPPT_ESCALATE_COUNT
-#define MPPT_ESCALATE_COUNT          4
-#endif
-
-/* MPP lock deadbands. Inside both -> hold vref still (this is what kills
- * the steady-state dither that plain P&O always has).
+/*  6. BETA METHOD - the tracker                                         */
+/* ===================================================================== */
+/*
+ *      beta = ln(I/V) - c*V          c = 1/Vt
  *
- * The power deadband is RELATIVE (per-mille of present power) with an
- * absolute floor, for the same reason the transient threshold is relative:
- * a fixed 0.5 W deadband is invisible at full sun and swallows the entire
- * signal in deep shade. */
-#ifndef MPPT_DP_DEADBAND_PERMILLE
-#define MPPT_DP_DEADBAND_PERMILLE    8    /* 0.8% of present power  */
-#endif
-#ifndef MPPT_DP_DEADBAND_MIN
-#define MPPT_DP_DEADBAND_MIN       500    /* floor: 50 mW, 0.1 mW units */
+ * The useful property, and the reason this is worth the arithmetic: beta
+ * evaluated at the MPP is very nearly INDEPENDENT OF IRRADIANCE. So instead
+ * of searching for the peak, compute beta from the present operating point
+ * and drive vref until beta equals its known MPP value. It is a regulator,
+ * not a hill-climber - there is no perturbation, so there is no dither and
+ * nothing to oscillate.
+ *
+ * WHY THIS ONE AND NOT PLAIN INCREMENTAL CONDUCTANCE
+ *
+ * True INC solves dI/dV = -I/V, which needs a DIFFERENCE of currents. On a
+ * 120 mA array spanning 20 ADC counts, dI is essentially quantisation noise;
+ * that is what defeated the power-domain tracker. beta needs only ABSOLUTE
+ * I and V, which average cleanly, and it is dominated by the voltage term:
+ *
+ *      dbeta/dV = -1/V - c  ~= -0.09 - 1.33 = -1.42 per volt
+ *
+ * so the precisely-measured c*V term carries the sensitivity and the noisy
+ * ln(I) term contributes weakly. A 5% error in I moves the setpoint 36 mV.
+ *
+ * Modelled against a panel WITH series resistance, which is what makes real
+ * Vmpp/Voc differ from the ideal-diode value:
+ *
+ *      Rs      irradiance   fixed k=0.781    analytic(Voc)    beta
+ *      0 ohm      full          96.6%           100.0%       100.0%
+ *      5 ohm      full          99.3%            98.1%       100.0%
+ *     10 ohm      full          99.9%            92.5%       100.0%
+ *     10 ohm      35%           98.7%            99.7%        98.1%
+ *
+ * THE CATCH, AND IT IS A REAL ONE
+ *
+ * beta depends on ABSOLUTE current accuracy, and this board is brutal about
+ * that: at 136 mV/A, one millivolt of sense-amp offset is 7.4 mA, which is
+ * 6% of a 120 mA panel. Tolerance is about +-2 mV; past +-5 mV the reading
+ * clamps at zero, ln blows up and the setpoint rails.
+ *
+ * No hand-set CURRENT_OFFSET is that good. So the zero is measured instead,
+ * during the boot quiet window where the panel is unloaded and the motor is
+ * stopped - see MPPT_BOOT_VOC_SETTLE_MS. That is what makes this viable.
+ */
+
+/* Vt for the ARRAY (not one cell): the diode thermal/ideality voltage,
+ * n*k*T/q multiplied by the number of cells in series, in 10 mV units.
+ * Sets c = 1/Vt. Calibrate from a measured I-V curve if you have one; the
+ * default matches the 13.4 V bench panel. */
+#ifndef MPPT_BETA_VT
+#define MPPT_BETA_VT                75    /* 0.75 V */
 #endif
 
-/* QUANTISATION FLOOR ON THE DEADBAND. This is the one that bit us.
+/* beta at the MPP, Q8. Nearly irradiance-invariant - that is the whole
+ * point - but it IS panel-specific, and it also shifts with series
+ * resistance. Computed for the 13.4 V / 120 mA bench panel:
  *
- * dp is computed as v*i, so one ADC count of current shows up as a step of
- * v * MPPT_I_LSB in dp whether or not anything real happened. If the
- * deadband is smaller than that step, the tracker reverses direction on
- * pure quantisation and hunts forever - which is exactly what a small
- * panel on a 5.9 mA/count sense chain looks like.
+ *      Rs = 0 ohm   Vmpp 11.32 V   ->  -5049
+ *      Rs = 5 ohm   Vmpp 10.83 V   ->  -4869
+ *      Rs = 10 ohm  Vmpp 10.35 V   ->  -4693
  *
- * Measured on the 13.4 V / 120 mA bench panel (20 ADC counts end to end):
- * one count of current produced 6.2x the deadband, and tracking efficiency
- * sat at 77.6%. Raising the deadband above the quantisation step took it
- * to 90.7% with no other change.
- *
- * The floor is therefore computed at runtime from the live voltage rather
- * than being a fixed number, so it stays correct as the operating point
- * moves. Set the multiplier to 0 to disable. */
-#ifndef MPPT_DP_QUANT_MULT
-#define MPPT_DP_QUANT_MULT           3    /* deadband >= 3 counts of dp */
-#endif
-#ifndef MPPT_DV_DEADBAND
-#define MPPT_DV_DEADBAND             3    /* 0.03 V, in 10 mV       */
+ * TO CALIBRATE ON YOUR PANEL: find the best operating point by hand - the
+ * throttle setting that gives peak rpm - and read mppt.beta off telemetry.
+ * That number is this constant. It is a single reading and it does not
+ * need repeating per irradiance, which is exactly what makes beta better
+ * behaved than a fixed k. */
+#ifndef MPPT_BETA_MPP_Q8
+#define MPPT_BETA_MPP_Q8         (-5062)
 #endif
 
-/* Irradiance-transient detection, RELATIVE (percent of present current).
- * Absolute amp thresholds are useless here: 0.5 A is a rounding error at
- * full sun and the entire output in deep shade. If |di| exceeds this
- * fraction of i, the power change is attributed to irradiance rather than
- * to our perturbation, and the tracker holds direction instead of
- * spuriously reversing. */
-#ifndef MPPT_I_TRANSIENT_PCT
-#define MPPT_I_TRANSIENT_PCT        18    /* 18% */
+/* Regulator gain: 10 mV of vref per unit of beta error, Q8. Deliberately
+ * slow - this closes a loop around the panel curve, and the inner PI plus
+ * the propeller are inside it. */
+#ifndef MPPT_BETA_GAIN_Q8
+#define MPPT_BETA_GAIN_Q8            6
 #endif
 
-/* If a transient is large enough, abandon hill-climbing entirely and
- * re-seed from the fractional-Voc estimate. This is the only way to
- * recover from a 10:1 swing in tens of milliseconds. */
-#ifndef MPPT_I_RESEED_PCT
-#define MPPT_I_RESEED_PCT           60    /* 60% */
+/* Ticks held in SEED before beta starts trimming: long enough for the inner
+ * PI to settle at the fractional-Voc setpoint. */
+#ifndef MPPT_SEED_TICKS
+#define MPPT_SEED_TICKS             10
 #endif
+
+/* Control ticks between beta updates. */
+#ifndef MPPT_BETA_PERIOD_TICKS
+#define MPPT_BETA_PERIOD_TICKS      20
+#endif
+
+/* Below this current the ln() term is meaningless and beta is not usable;
+ * fall back to plain fractional-Voc until there is a real reading. */
+#ifndef MPPT_BETA_I_MIN
+#define MPPT_BETA_I_MIN  ((((3 * MPPT_I_LSB_Q8) >> 8) + 1))
+#endif
+
+/* How far beta is allowed to pull vref away from the fractional-Voc seed.
+ * Bounds any damage a bad current reading can do. */
+#ifndef MPPT_BETA_TRIM_MAX
+#define MPPT_BETA_TRIM_MAX         300    /* +-3.00 V */
+#endif
+
+/* ===================================================================== */
+/*
+ * WHY RPM AND NOT PANEL POWER
+ *
+ * Fractional-Voc is open-loop on a constant. It cannot find the peak; it
+ * can only sit where MPPT_K_FOCV_Q8 says the peak ought to be. That is
+ * fine until the constant is wrong, and on a real panel it usually is.
+ *
+ * The obvious fix is to hill-climb on measured power, and on this hardware
+ * that does not work: a 120 mA array spans 20 ADC counts of current, so
+ * dP is mostly quantisation. But the ESC has a
+ * far better signal sitting unused. e_com_time is the electrical
+ * revolution period in microseconds, so at 44-47 krpm one LSB is about
+ * 0.5% of speed - ten times finer than one current count - and it can be
+ * averaged over hundreds of revolutions.
+ *
+ * For a fixed-pitch prop the load torque goes as w^2, so shaft power goes
+ * as w^3 and maximum rpm IS maximum shaft power. Two consequences worth
+ * being explicit about:
+ *
+ *   - It is not merely a proxy for panel power. On an aircraft, thrust is
+ *     the actual objective, and maximising rpm also absorbs variation in
+ *     motor efficiency - which panel-power MPPT ignores by construction.
+ *   - The 6.8% speed difference between 44 and 47 krpm is ~22% of shaft
+ *     power. Small rpm errors are not small power errors.
+ *
+ * WHAT IS ADAPTED
+ *
+ * The ratio k, not a voltage offset. The FOCV error is (k_true - k0)*Voc,
+ * which scales with Voc, so correcting k stays right as irradiance and
+ * temperature move Voc around; a fixed voltage trim would not.
+ *
+ * The inner PI still regulates fast to whatever setpoint k produces. Only
+ * k moves slowly, which is the whole point: perturbations have to outlast
+ * the propeller's 0.5-2 s mechanical time constant before the rpm they
+ * cause means anything.
+ *
+ * k is NOT written to EEPROM. It re-learns from MPPT_K_FOCV_Q8 within
+ * ~10 s of steady throttle each flight.
+ */
 
 /* ---------------------------------------------------------------------
- * HILL-CLIMB GATE - when is the current channel worth listening to?
+ * MANOEUVRE NOTE (aircraft-specific)
  *
- * The tracker infers dP/dV from a current measurement. If the operating
- * current is only a handful of ADC counts, dP is dominated by quantisation
- * and hill-climbing does worse than not trying: on the 120 mA bench panel
- * every tuning of the hill-climber topped out at 86.6%, while plain
- * fractional-Voc - which needs no current measurement at all - held 96.8%
- * dead flat.
- *
- * So: hill-climb only above MPPT_TRACK_MIN_COUNTS of current, and run pure
- * fractional-Voc below it. The threshold is in ADC counts, not amps, so it
- * follows the sense chain automatically.
- *
- * 125 counts is where one count equals the 0.8% relative power deadband.
+ * ONE HARDWARE POINT, worth more than any firmware: wire the port and
+ * starboard arrays in PARALLEL, not in series. In series, wing dihedral
+ * makes one string weaker in a bank, its bypass diode conducts, and the
+ * P-V curve grows a second local peak. beta assumes a single-peaked curve
+ * - as does every simple tracker - and will happily regulate to the wrong
+ * one. In parallel the currents just add and the curve stays
+ * single-peaked.
  * ------------------------------------------------------------------- */
-#ifndef MPPT_TRACK_MIN_COUNTS
-#define MPPT_TRACK_MIN_COUNTS      125
-#endif
-#define MPPT_TRACK_I_MIN \
-    ((((int32_t)MPPT_TRACK_MIN_COUNTS * MPPT_I_LSB_Q8) >> 8) + 1)
 
-/* Set to force one mode regardless of measured current. Useful for bringing
- * a new array up: MPPT_MODE_FOCV is smooth and cannot mis-track. */
-#define MPPT_MODE_AUTO               0
-#define MPPT_MODE_FOCV               1
-#define MPPT_MODE_HILLCLIMB          2
-#ifndef MPPT_MODE
-#define MPPT_MODE            MPPT_MODE_AUTO
+/* ===================================================================== */
+/*  6b. TRACKER SELECTION                                                */
+/* ===================================================================== */
+/*
+ * Two outer loops, one compiled in at a time.
+ *
+ *   MPPT_TRACKER_BETA  beta = ln(I/V) - c*V, regulated. No perturbation,
+ *                      no dither. Needs a REAL current sense chain.
+ *   MPPT_TRACKER_RPM   perturb-and-observe on e_com_time, adapting k.
+ *                      Needs no current measurement at all. Dithers by
+ *                      construction, +-MPPT_K_STEP_Q8/256 of Voc.
+ *
+ * WHICH ONE, AND WHY IT IS NOT AUTOMATIC
+ *
+ * Inc/targets.h ends with a `#ifndef MILLIVOLT_PER_AMP / #define ... 20`
+ * fallback, so a board with no shunt still reports a current - a fabricated
+ * one. 136 of 254 board blocks are in that position, and the preprocessor
+ * cannot tell them apart from a board that genuinely chose 20 mV/A.
+ *
+ * Beta drives the setpoint from ln(I/V) and does not degrade gracefully on
+ * an invented current: it walks vref into a clamp rail. So the choice is
+ * made outside the compiler, by test/mppt_targets.sh, which parses
+ * targets.h and asks whether the board's OWN block defines
+ * MILLIVOLT_PER_AMP. Boards that do get beta; boards that do not get rpm.
+ *
+ * A board block may of course pin it explicitly.
+ */
+#define MPPT_TRACKER_BETA            0
+#define MPPT_TRACKER_RPM             1
+#ifndef MPPT_TRACKER
+#define MPPT_TRACKER  MPPT_TRACKER_BETA
+#endif
+#if MPPT_TRACKER != MPPT_TRACKER_BETA && MPPT_TRACKER != MPPT_TRACKER_RPM
+#error "MPPT_TRACKER must be MPPT_TRACKER_BETA or MPPT_TRACKER_RPM"
 #endif
 
 /* ===================================================================== */
-/*  6b. RPM FEEDBACK - slow adaptation of the FOCV ratio                 */
+/*  6c. RPM FEEDBACK - fallback tracker, no current sense needed          */
 /* ===================================================================== */
 /*
  * WHY RPM AND NOT PANEL POWER
@@ -509,10 +568,7 @@ _Static_assert(MPPT_COAST_EXIT_DUTY > MPPT_COAST_DUTY_TH,
  * ~10 s of steady throttle each flight.
  */
 
-/* Set to 0 to compile the rpm tracker out and run plain fixed-k FOCV. */
-#ifndef MPPT_RPM_TRACK
-#define MPPT_RPM_TRACK               1
-#endif
+/* Selected by MPPT_TRACKER above, not by a switch of its own. */
 
 /* Settling allowance after each perturbation, before rpm is believed.
  * MUST exceed the prop's mechanical time constant or the tracker measures
@@ -674,57 +730,6 @@ _Static_assert(MPPT_COAST_EXIT_DUTY > MPPT_COAST_DUTY_TH,
 #endif
 #define MPPT_BOOT_VOC_SETTLE_TICKS MPPT_MS_TO_TICKS(MPPT_BOOT_VOC_SETTLE_MS)
 
-/* ---------------------------------------------------------------------
- * PERIODIC Voc SWEEP
- *
- * Force duty to 0 briefly and read the true open-circuit voltage. This is
- * the only Voc source that does not depend on the current sensor at all,
- * which is what makes it usable on an array whose whole Isc is 20 ADC
- * counts wide.
- *
- * The sweep ends as soon as the bus stops rising, so it costs only as long
- * as the panel needs to charge Cbus: ~0.5 ms on a 3 A array, ~12 ms on the
- * 120 mA bench panel (C*dV/I = 470uF * 2.9 V / 0.12 A).
- *
- * Set MPPT_VOC_SWEEP_INTERVAL_MS to 0 to disable.
- * ------------------------------------------------------------------- */
-/* *** DISABLED BY DEFAULT, AND THINK HARD BEFORE ENABLING IT. ***
- *
- * "Duty 0" is not coasting on this hardware. AM32 drives complementary PWM
- * whenever eepromBuffer.comp_pwm is set (see phaseAPWM() in phaseouts.c), so
- * at duty 0 the low-side FETs are on ~100% of the time and the energised
- * winding pair is shorted through them. That is synchronous BRAKING. On the
- * bench it is unmistakable: the motor is actively braked once per interval
- * and the whole aircraft stutters.
- *
- * The energy cost was never the problem. Measured over a 60 s flight-scale
- * run: 2 s -> 93.3%, 5 s -> 95.1%, 15 s -> 96.3%, off -> 97.0%. Losing 0.75%
- * would be fine. Braking the propeller every 15 seconds is not.
- *
- * Boot Voc plus the opportunistic estimator above covers it instead. Voc is
- * measured properly at power-up - panel unloaded, motor stopped, no braking
- * possible - and refreshed every time the throttle comes down. Thermal drift
- * is about -0.3%/degC, and per TI TIDA-010042 a setpoint within 2.5% of Vmpp
- * still returns >99.5% of available power, so a stale estimate is cheap.
- *
- * Only enable this if comp_pwm is OFF on your setup, in which case duty 0
- * really is a coast. Even then the body diodes will rectify into the bus if
- * back-EMF exceeds bus voltage, which would read as a falsely high Voc. */
-#ifndef MPPT_VOC_SWEEP_INTERVAL_MS
-#define MPPT_VOC_SWEEP_INTERVAL_MS   0    /* 0 = disabled */
-#endif
-#ifndef MPPT_VOC_SWEEP_MAX_MS
-#define MPPT_VOC_SWEEP_MAX_MS       40    /* hard timeout */
-#endif
-#ifndef MPPT_VOC_SWEEP_SETTLE_DV
-#define MPPT_VOC_SWEEP_SETTLE_DV     3    /* 0.03 V/tick = stopped rising */
-#endif
-#ifndef MPPT_VOC_SWEEP_SETTLE_TICKS
-#define MPPT_VOC_SWEEP_SETTLE_TICKS  3
-#endif
-#define MPPT_VOC_SWEEP_INTERVAL_TICKS MPPT_MS_TO_TICKS(MPPT_VOC_SWEEP_INTERVAL_MS)
-#define MPPT_VOC_SWEEP_MAX_TICKS      MPPT_MS_TO_TICKS(MPPT_VOC_SWEEP_MAX_MS)
-
 /* ===================================================================== */
 /*  8. STARTUP                                                           */
 /* ===================================================================== */
@@ -763,8 +768,20 @@ _Static_assert(MPPT_COAST_EXIT_DUTY > MPPT_COAST_DUTY_TH,
 
 /* AM32 divides by the literal 41 (= 4095/100, rounded up) in its current
  * path, which makes the intermediate "millivolts * 100". Kept identical. */
+/* AM32 divides by the literal 41 (= 4095/100, rounded up) in its current
+ * path, which makes the intermediate "millivolts * 100". Kept identical.
+ *
+ * This is 12-bit ADC arithmetic. The 16-bit NXP MCXA parts stage it
+ * differently and would read 16x low here, so they are rejected outright
+ * below rather than shipped with silently wrong scaling. */
 #ifndef MPPT_I_SCALE_DIV
 #define MPPT_I_SCALE_DIV            41
+#endif
+
+#ifdef NXP
+#error "MPPT does not support the 16-bit NXP MCXA ADC path - the current \
+scaling in mppt_read_amps() assumes a 12-bit result. Untested, so refused \
+rather than silently mis-scaled by 16x."
 #endif
 
 /* ---------------------------------------------------------------------
@@ -822,8 +839,6 @@ _Static_assert(MPPT_V_COLLAPSE + MPPT_V_COLLAPSE_HYST
     "collapse threshold leaves no usable vref band below Voc");
 _Static_assert((MPPT_VOC_NOMINAL * MPPT_K_FOCV_Q8 >> 8) > MPPT_V_COLLAPSE,
     "fractional-Voc seed sits below the collapse threshold");
-_Static_assert(MPPT_AVG_TICKS >= 1 && MPPT_AVG_TICKS <= MPPT_PERIOD_TICKS,
-    "MPPT_AVG_TICKS must be in 1..MPPT_PERIOD_TICKS");
 _Static_assert(MPPT_TICK_HZ >= 500,
     "control tick below 500 Hz - the PI gains and deadbands do not hold");
 _Static_assert(MPPT_RECOVER_OK_TICKS >= 1 && MPPT_RECOVER_TICKS >= 1,
@@ -855,8 +870,7 @@ typedef enum {
     MPPT_STATE_OFF     = 0,   /* disarmed / not running                  */
     MPPT_STATE_SEED    = 1,   /* seeding vref from fractional Voc        */
     MPPT_STATE_TRACK   = 2,   /* normal tracking (FOCV or hill-climb)    */
-    MPPT_STATE_RECOVER = 3,   /* bus collapse - unloading, SAFETY PATH   */
-    MPPT_STATE_VOC     = 4    /* duty 0, measuring open-circuit voltage  */
+    MPPT_STATE_RECOVER = 3    /* bus collapse - unloading, SAFETY PATH   */
 } mppt_state_t;
 
 typedef struct {
@@ -865,6 +879,7 @@ typedef struct {
     /* Filtered measurements (10 mV / 10 mA units) */
     int32_t  v;                 /* panel/bus voltage                     */
     int32_t  i;                 /* bus current                           */
+    int32_t  i_q8;              /* filter state, Q8 - see mppt.c          */
     int32_t  p;                 /* v*i, in 0.1 mW units                  */
 
     /* Control */
@@ -875,57 +890,43 @@ typedef struct {
     uint16_t duty;              /* PI output, AM32 duty units 0..2000    */
     uint16_t duty_applied;      /* duty actually handed to the PWM       */
 
-    /* Tracker internals */
     int32_t  i_term_q12;
-    int32_t  p_last;
-    int32_t  v_last;
-    int32_t  i_last;
-    int32_t  step;
-    int32_t  dp_drift;          /* manoeuvre-driven dP, subtracted out    */
-    int8_t   dir;
-    uint8_t  phase;             /* MPPT_PHASE_DRIFT / _RESPONSE           */
-    uint8_t  railed;            /* last step was swallowed by the clamp   */
-    uint8_t  same_dir_count;
 
-    /* Averaging accumulators */
-    int32_t  v_acc;
-    int32_t  i_acc;
-    uint8_t  acc_n;
-    uint8_t  tick;
+    /* Tracker state. k is moved by the rpm tracker, beta_trim by the beta
+     * regulator; only one is active, and mppt_focv_seed() applies both so
+     * the seed is correct either way. */
+    int32_t  k_focv_q8;
 
-    /* Boot Voc capture */
-    int32_t  voc_boot;          /* what the settled boot read gave, 10 mV */
-    int32_t  quiet_v_last;
-    uint16_t quiet_ticks;
-    uint8_t  boot_voc_done;
-
-    /* RPM feedback - slow adaptation of the FOCV ratio */
-    int32_t  k_focv_q8;         /* adapted Vmpp/Voc, Q8. THE learned value */
-    int32_t  rpm_acc;           /* sum of e_com_time over the window      */
+    /* RPM perturb-and-observe */
+    int32_t  rpm_acc;
     int32_t  rpm_acc_last;
     uint16_t rpm_n;
     uint16_t rpm_ticks;
-    uint16_t rpm_input_ref;     /* throttle at the start of the cycle     */
-    uint16_t rpm_steps;         /* decisions taken - telemetry            */
+    uint16_t rpm_input_ref;
+    uint16_t rpm_steps;         /* decisions taken - telemetry             */
     uint8_t  rpm_phase;
     uint8_t  rpm_have_last;
     int8_t   rpm_dir;
 
-    /* Voc sweep */
-    uint16_t since_sweep;       /* ticks since the last sweep             */
-    uint16_t sweep_ticks;       /* ticks spent in the current sweep       */
-    int32_t  sweep_v_last;      /* for the "stopped rising" test          */
-    int32_t  sweep_i_term;      /* integrator parked across the sweep     */
-    uint8_t  sweep_settle_n;
+    /* Beta method */
+    int32_t  beta;              /* live beta, Q8 - telemetry / calibration */
+    int32_t  beta_trim;         /* offset from the FOCV seed, 10 mV        */
+    uint16_t beta_ticks;
+    uint8_t  beta_valid;        /* 1 = current usable, regulator running   */
+
+    /* Boot Voc capture */
+    int32_t  voc_boot;          /* what the settled boot read gave, 10 mV */
+    int32_t  i_zero_raw;        /* measured sense-amp zero, raw ADC counts */
+    uint8_t  i_zero_done;
+    int32_t  quiet_v_last;
+    uint16_t quiet_ticks;
+    uint8_t  boot_voc_done;
 
     /* Diagnostics - safe to stream over telemetry */
-    uint8_t  hill_climb;        /* 1 = climbing, 0 = fractional-Voc only  */
     uint8_t  coasting;          /* 1 = FETs floated, motor freewheeling   */
     uint16_t coast_events;
     uint16_t recover_ticks;
     uint16_t collapse_events;
-    uint16_t reseed_events;
-    uint16_t voc_sweeps;
 } mppt_t;
 
 extern mppt_t mppt;
@@ -956,7 +957,6 @@ static inline uint8_t mppt_is_active(void)
 {
     return (mppt.state == MPPT_STATE_TRACK) ||
            (mppt.state == MPPT_STATE_SEED)  ||
-           (mppt.state == MPPT_STATE_VOC)   ||
            (mppt.state == MPPT_STATE_RECOVER);
 }
 

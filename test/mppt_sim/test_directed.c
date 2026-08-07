@@ -1,23 +1,22 @@
 /*
- * Directed test for the coast path.
+ * Directed tests for the parts of mppt.c the plant model cannot reach.
  *
- * The full plant model in sim.c cannot reliably drive the module into
- * RECOVER: a spinning motor regenerates through the complementary FETs and
- * props the bus up, and if Cbus is made small enough to actually collapse,
- * it collapses in well under one 1 ms control tick so the ADC never sees it.
- * Rather than contrive a scenario, this drives the ADC inputs directly and
+ * The full sim in sim.c is a closed loop, which is exactly what makes it a
+ * poor tool for some of this. It cannot reliably drive the module into
+ * RECOVER - a spinning motor regenerates through the complementary FETs and
+ * props the bus up, and if Cbus is made small enough to actually collapse it
+ * does so in well under one 1 ms control tick, so the ADC never sees it. Nor
+ * can it exercise the boot-Voc window, because it arms almost immediately.
+ * Rather than contrive scenarios, this drives the ADC inputs directly and
  * asserts on the state machine.
  *
- * What it pins down:
- *   1. Normal running does not coast.
- *   2. Spin-up does not coast, even though duty passes through zero. This is
- *      the one that bit - gating coast on low duty alone floats the FETs
- *      exactly when the motor is trying to start.
- *   3. A bus collapse enters RECOVER and coasts once duty has decayed.
- *   4. allOff() is re-asserted on every tick while coasting, because
- *      comStep() re-drives the pin modes at each commutation.
- *   5. Recovery clears the coast and the FETs are driven again.
- *   6. The hard absolute-minimum cut coasts immediately.
+ * Covers:
+ *   - coast / unload path (duty 0 is a BRAKE on this hardware, not a coast)
+
+ *     convention, or the rpm fallback and its guards
+ *   - current-sense zero self-calibration
+ *
+ * Run with:  ./run.sh test
  */
 #include <stdio.h>
 #include <stdint.h>
@@ -178,8 +177,8 @@ int main(void)
         ok("captured the right voltage",
            mppt.voc_boot > 1320 && mppt.voc_boot < 1360);
         ok("setpoint follows the capture",
-           mppt.vref > ((1340 * MPPT_K_MIN_Q8) >> 8) &&
-           mppt.vref < ((1360 * MPPT_K_MAX_Q8) >> 8));
+           mppt.vref > ((1320 * MPPT_K_FOCV_Q8) >> 8) &&
+           mppt.vref < ((1370 * MPPT_K_FOCV_Q8) >> 8));
 
         /* an arming tune afterwards must not disturb the captured value */
         {
@@ -192,45 +191,123 @@ int main(void)
         }
     }
 
+#if MPPT_TRACKER == MPPT_TRACKER_BETA
     /* ------------------------------------------------------------------
-     * rpm tracker guards
+     * beta regulator
+     * ---------------------------------------------------------------- */
+    printf("\nbeta regulator\n");
+    {
+        int32_t t1, t2;
+
+        armed = 1; running = 1; input = 2047; zero_crosses = 5000;
+        play_tone_flag = 0; e_com_time = 200;
+        mppt_init();
+        /* Only briefly: this test drives the ADCs directly with no plant, so
+         * v does not respond to duty and the regulator has no way to
+         * converge - left running it winds the trim until duty rails and the
+         * authority gate (correctly) marks beta invalid. Check it while the
+         * PI still has authority. */
+        for (i = 0; i < 40; i++) step(10.5, 0.11, 1200);
+        ok("computes a beta when current is usable",
+           mppt.beta_valid && mppt.beta < 0);
+
+        /* ...and that the authority gate does exactly that once duty rails */
+        for (i = 0; i < 2000; i++) step(10.5, 0.11, 1200);
+        ok("marks beta invalid once the PI loses authority", !mppt.beta_valid);
+
+        /* Sign convention. beta below target means the panel is being held
+         * ABOVE Vmpp, so the trim must come DOWN. Getting this backwards
+         * walks the setpoint into the short-circuit region. */
+        t1 = mppt.beta_trim;
+        for (i = 0; i < 2000; i++) step(12.6, 0.05, 1200);  /* high V, low I */
+        t2 = mppt.beta_trim;
+        ok("held above Vmpp, the trim decreases", t2 < t1);
+
+        t1 = mppt.beta_trim;
+        for (i = 0; i < 2000; i++) step(8.5, 0.118, 1200);  /* low V, high I */
+        t2 = mppt.beta_trim;
+        ok("held below Vmpp, the trim increases", t2 > t1);
+
+        /* Low light: current falls under the resolvable floor. The trim is
+         * the learned part and must survive, or every cloud would throw the
+         * calibration away. */
+        t1 = mppt.beta_trim;
+        for (i = 0; i < 4000; i++) step(11.0, 0.000, 1200);
+        ok("goes invalid when current is unusable", !mppt.beta_valid);
+        ok("holds the learned trim through low light", mppt.beta_trim == t1);
+
+        /* and it can never pull the setpoint arbitrarily far */
+        for (i = 0; i < 60000; i++) step(8.0, 0.119, 1200);
+        ok("trim stays inside its bound",
+           mppt.beta_trim <= MPPT_BETA_TRIM_MAX &&
+           mppt.beta_trim >= -MPPT_BETA_TRIM_MAX);
+
+        /* zero current must not reach ln(0) */
+        for (i = 0; i < 200; i++) step(11.0, 0.0, 1200);
+        ok("no ln(0) at zero current", !mppt.beta_valid);
+    }
+
+#else
+    /* ------------------------------------------------------------------
+     * rpm tracker (the no-current-sense fallback)
      * ---------------------------------------------------------------- */
     printf("\nrpm tracker\n");
     {
         int32_t k0;
 
         armed = 1; running = 1; input = 2047; zero_crosses = 5000;
-        play_tone_flag = 0;
-        e_com_time = 200;
+        play_tone_flag = 0; e_com_time = 200;
         mppt_init();
-        for (i = 0; i < 400; i++) step(10.5, 0.11, 1200);
         ok("starts from the compile-time ratio",
-           mppt.k_focv_q8 == MPPT_K_FOCV_Q8 || mppt.rpm_steps > 0);
+           mppt.k_focv_q8 == MPPT_K_FOCV_Q8);
 
-        /* the pre-spin-up sentinel must be rejected */
+        /* AM32 reports 65408 until the motor is turning. Adapting on that
+         * would move k on a number that is not a speed at all. */
         k0 = mppt.k_focv_q8; mppt.rpm_steps = 0;
         e_com_time = 65408;
         for (i = 0; i < 4000; i++) step(10.5, 0.11, 1200);
         ok("rejects the 65408 pre-spin-up sentinel",
            mppt.rpm_steps == 0 && mppt.k_focv_q8 == k0);
 
-        /* a moving throttle must not be read as an rpm response */
+        /* A moving throttle changes rpm for reasons that have nothing to do
+         * with the setpoint; comparing across it walks k the wrong way. */
         e_com_time = 200; mppt.rpm_steps = 0;
         for (i = 0; i < 4000; i++) {
-            input = (uint16_t)(1500 + (i % 400));   /* well past the tolerance */
+            input = (uint16_t)(1500 + (i % 400));
             step(10.5, 0.11, 1200);
         }
         ok("does not adapt while the throttle is moving", mppt.rpm_steps == 0);
 
-        /* steady again: it should resume and move k */
         input = 2047; mppt.rpm_steps = 0;
         for (i = 0; i < 4000; i++) step(10.5, 0.11, 1200);
         ok("adapts again once the throttle settles", mppt.rpm_steps > 0);
 
-        /* and never outside the physical bounds */
+        /* However badly the rpm signal misbehaves, k cannot leave the band
+         * that every silicon panel's MPP lives in. */
         for (i = 0; i < 40000; i++) { e_com_time = 200 + (i % 3); step(10.5, 0.11, 1200); }
         ok("k stays inside the sanity bounds",
            mppt.k_focv_q8 >= MPPT_K_MIN_Q8 && mppt.k_focv_q8 <= MPPT_K_MAX_Q8);
+    }
+#endif
+
+    /* ------------------------------------------------------------------
+     * current-sense zero self-calibration
+     * ---------------------------------------------------------------- */
+    printf("\ncurrent-sense zero\n");
+    {
+        const int settle = MPPT_BOOT_VOC_SETTLE_TICKS;
+        armed = 0; running = 0; input = 0; zero_crosses = 0; play_tone_flag = 0;
+        ADC_raw_volts = adc_v(13.40); ADC_raw_current = adc_i(0.0);
+        mppt_init();
+        ok("uses CURRENT_OFFSET until calibrated", !mppt.i_zero_done);
+        for (i = 0; i < settle + 8; i++) step(13.40, 0.0, 0);
+        ok("captures the zero in the quiet window", mppt.i_zero_done);
+        ok("captured zero matches the sensor midpoint",
+           mppt.i_zero_raw > adc_i(0.0) - 3 && mppt.i_zero_raw < adc_i(0.0) + 3);
+        /* and a real current still reads correctly through the new zero */
+        for (i = 0; i < 60; i++) step(11.0, 0.100, 400);
+        ok("current reads sanely after calibration",
+           mppt.i >= 7 && mppt.i <= 13);
     }
 
     printf(fails ? "\n%d FAILED\n" : "\nall passed\n", fails);

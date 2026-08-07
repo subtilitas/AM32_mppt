@@ -3,48 +3,46 @@
  * See mppt.h for architecture, references and configuration.
  *
  * ---------------------------------------------------------------------
- * ALGORITHM SELECTION - why this one
+ * ALGORITHM SELECTION - how it ended up here
  * ---------------------------------------------------------------------
- * Incremental conductance in dP/dV form, with Hassani's counter-based
- * two-step escalation and a fractional-Voc re-seed.
+ * Default is the BETA METHOD: beta = ln(I/V) - c*V, regulated to its known
+ * MPP value. A regulator, not a hill-climber, so nothing perturbs and
+ * nothing dithers. Full detail in mppt.h section 6a.
  *
- *  - dP/dV, not dI/dV. AN1521 implemented both on real hardware and found
- *    the dI/dV form's sign flipped erratically on filtered-but-real ADC
- *    noise, which "confused the algorithm and caused it to get stuck".
- *    The dP/dV form worked. We are noisier than they were (a commutating
- *    BLDC on the same shunt), so this is not a close call.
+ * Three alternatives were implemented, measured against the same plant, and
+ * REMOVED. Recorded here so nobody re-derives them:
  *
- *  - Incremental conductance, not plain P&O. INC can LOCK at the MPP
- *    (dP/dV ~ 0 -> hold), while P&O dithers forever by construction and
- *    gives back 1-2% of available power. INC also recovers correctly when
- *    the operating point moved for a reason other than our perturbation,
- *    which on a banking wing is most of the time.
+ *  - Incremental conductance (dP/dV, Hassani two-step). The textbook
+ *    choice, and unusable here. It infers dP/dV from a DIFFERENCE of
+ *    currents, and this board's array spans about 20 ADC counts, so that
+ *    difference is very nearly pure quantisation. Every tuning of it
+ *    topped out around 86% while doing nothing at all held 97%.
  *
- *  - Two-step escalation, not a magnitude-proportional step. The step is
- *    chosen by a COUNTER of consecutive same-direction moves, so it is
- *    scale-free. A step calibrated in watts is correct at exactly one
- *    irradiance; with a 10:1 swing it is either glacial or unstable at
- *    the ends. The counter behaves identically at 5 W and 50 W.
+ *  - Fractional Voc. vref = k * Voc, open-loop on a constant. Cheap and
+ *    unconditionally stable, but the constant is usually wrong: the
+ *    textbook 0.781 put the setpoint at 10.47 V against a real Vmpp of
+ *    11.32 V. It survives as the seed, the transient fallback, and what
+ *    beta degrades into when the current reading dies.
  *
- *  - Fractional Voc for re-seeding, not for tracking. Pure FOCV is only
- *    ~95-98% accurate, so it is a bad tracker. But it converges in ONE
- *    sample, which makes it the right tool for the two cases hill-climbing
- *    handles worst: cold start, and a step change too large to walk to.
- *    Critically, on this airframe Voc is free to measure - at duty 0 the
- *    bus voltage IS Voc, no pilot cell or load-disconnect switch needed.
+ *  - RPM perturb-and-observe on e_com_time. Reached 99.6% and needs no
+ *    current measurement at all, so it is the only one that still works
+ *    below ~25% irradiance where beta goes blind. Removed because it
+ *    oscillates by construction: +-0.21 V on vref, forever. That is the
+ *    dither beta exists to eliminate. The measured crossover is in
+ *    doc/MPPT.md section 7, item 7, if you ever want it back.
  *
  * ---------------------------------------------------------------------
  * PI TUNING RECIPE (do this on the bench, prop off, panel or PSU+resistor)
  * ---------------------------------------------------------------------
+ *
  * 1. Set MPPT_KI_DUTY_PER_VOLT_S = 0. Set KP = 4.
  * 2. Command a small vref step (e.g. 1 V) and log v. Raise KP until you
  *    see ~10% overshoot, then halve it. That is your KP.
  * 3. Raise KI until the steady-state error closes in ~5-10 ms without
  *    adding overshoot. Rule of thumb: KI ~ 20 * KP.
- * 4. Measure the 2% settling time of that step response. Set
- *    MPPT_PERIOD_TICKS >= settling_time_ms. If settling is 5 ms, the
- *    tracker runs at 200 Hz. Going faster than settling means you are
- *    measuring your own transient, and the tracker will wander.
+ * 4. Measure the 2% settling time of that step response. Any outer loop
+ *    must be slower than it - measuring your own transient is how a
+ *    tracker talks itself into walking the wrong way.
  * 5. Only then reconnect the prop.
  */
 
@@ -93,12 +91,10 @@ mppt_t mppt;
 
 /* Consecutive ticks the bus has been healthy while in RECOVER. */
 static uint8_t  recover_ok_ticks;
-/* Ticks spent in SEED before handing over to the hill-climber. */
+/* Ticks spent in SEED before beta takes over. */
 static uint8_t  seed_ticks;
 /* Consecutive ticks the inner PI has been holding v at vref. */
 static uint8_t  reg_ticks;
-/* Last value of mppt.hill_climb, to detect the FOCV <-> climb transition. */
-static uint8_t  hc_last;
 
 /* --------------------------------------------------------------------- */
 /* Small helpers                                                          */
@@ -110,15 +106,10 @@ static inline int32_t iabs32(int32_t x) { return (x < 0) ? -x : x; }
  * mppt.h - on this hardware duty 0 is a brake, not a coast. */
 static inline void mppt_coast(uint8_t on)
 {
-#if MPPT_COAST_ENABLE
     if (on && !mppt.coasting) {
         if (mppt.coast_events < 0xFFFFu) mppt.coast_events++;
     }
     mppt.coasting = on;
-#else
-    (void)on;
-    mppt.coasting = 0;
-#endif
 }
 
 static inline int32_t clamp32(int32_t x, int32_t lo, int32_t hi)
@@ -150,14 +141,80 @@ static inline int32_t mppt_read_volts(void)
 /* MPPT_I_SCALE_DIV and MPPT_MILLIVOLT_PER_AMP live in mppt.h - the latter
  * because the control loop must not inherit a gain that was deliberately
  * mis-set to make DShot telemetry readable. See the comment there. */
+/*
+ * The zero reference is MEASURED, not taken from CURRENT_OFFSET, whenever a
+ * boot capture has succeeded.
+ *
+ * This matters far more than it looks. At MPPT_MILLIVOLT_PER_AMP = 136, one
+ * millivolt of sense-amp offset is 7.4 mA - 6% of a 120 mA array. The beta
+ * regulator tolerates about +-2 mV and rails past +-5 mV, and no
+ * hand-entered constant survives temperature and part-to-part spread at
+ * that resolution. The boot quiet window gives the reading for free: panel
+ * unloaded, motor stopped, so whatever the ADC says then IS zero amps.
+ */
 static inline int32_t mppt_read_amps(void)
 {
     int32_t raw = (int32_t)ADC_raw_current;
-    int32_t x   = (raw * MPPT_ADC_VREF_MV) / MPPT_I_SCALE_DIV;      /* <= 3.3e5 */
-    x -= ((int32_t)CURRENT_OFFSET * 100);
+    int32_t x;
+
+    if (mppt.i_zero_done) {
+        raw -= mppt.i_zero_raw;
+        if (raw < 0) raw = 0;
+        x = (raw * MPPT_ADC_VREF_MV) / MPPT_I_SCALE_DIV;
+    } else {
+        x = (raw * MPPT_ADC_VREF_MV) / MPPT_I_SCALE_DIV;            /* <= 3.3e5 */
+        x -= ((int32_t)CURRENT_OFFSET * 100);
+    }
     x /= (int32_t)MPPT_MILLIVOLT_PER_AMP;                           /* 10 mA units */
     return (x < 0) ? 0 : x;
 }
+
+#if MPPT_TRACKER == MPPT_TRACKER_BETA
+/* --------------------------------------------------------------------- */
+/* Integer natural log, Q8                                                */
+/* --------------------------------------------------------------------- */
+/*
+ * ln(x) for x >= 1, to about 0.004 absolute. CLZ gives the exponent (one
+ * instruction on Cortex-M), a 17-entry table with linear interpolation
+ * gives the mantissa, then scale log2 -> ln.
+ *
+ * Accuracy needed is modest: beta uses ln(I) - ln(V), and dbeta/dV is about
+ * -1.42 per volt, so even 0.03 of log error is only ~20 mV of setpoint.
+ * No float, no libm, ~20 cycles.
+ */
+/* 256 * log2(1 + n/16), n = 0..16. The last entry MUST be 256, since
+ * log2(2) = 1; an off-the-end value here skews every mantissa and cost
+ * 0.037 of log error - 26 mV of setpoint - before it was spotted by
+ * checking the whole function against libm rather than eyeballing it. */
+static const uint16_t mppt_log2_tab[17] = {
+      0,  22,  44,  63,  82, 100, 118, 134, 150, 165, 179, 193, 207, 220,
+    232, 244, 256
+};
+
+static int32_t mppt_ln_q8(uint32_t x)
+{
+    int32_t e, log2_q8;
+    uint32_t m, idx, frac;
+
+    if (x == 0) return -32768;                 /* clamped, caller guards */
+
+    e = 31 - (int32_t)__builtin_clz(x);        /* floor(log2 x) */
+
+    /* Normalise to 8 fractional bits below the leading 1. */
+    m = (e >= 8) ? (x >> (e - 8)) : (x << (8 - e));
+    m &= 0xFF;                                 /* mantissa, 0..255 */
+
+    idx  = m >> 4;                             /* 0..15 */
+    frac = m & 0x0F;
+    log2_q8 = (e << 8)
+            + (int32_t)mppt_log2_tab[idx]
+            + (((int32_t)mppt_log2_tab[idx + 1] - (int32_t)mppt_log2_tab[idx])
+               * (int32_t)frac >> 4);
+
+    /* * ln(2), 0.693147 in Q16 = 45426 */
+    return (log2_q8 * 45426) >> 16;
+}
+#endif /* MPPT_TRACKER_BETA */
 
 /* --------------------------------------------------------------------- */
 /* Reference clamping                                                     */
@@ -181,13 +238,14 @@ static inline int32_t mppt_clamp_vref(int32_t vref)
     return clamp32(vref, lo, hi);
 }
 
-/* The fractional-Voc setpoint, using the ADAPTED ratio rather than the
- * compile-time one. mppt.k_focv_q8 starts at MPPT_K_FOCV_Q8 and is moved by
- * the rpm tracker; everything that seeds or re-seeds goes through here, so
- * the learned correction is never thrown away by a transient. */
+/* The fractional-Voc setpoint: the ratio (fixed under beta, adapted by
+ * the rpm tracker) plus beta's learned trim. Only one of the two moves in
+ * a given build, so applying both is always correct. Everything that seeds or re-seeds goes through
+ * here, so the trim is never thrown away by a transient. */
 static inline int32_t mppt_focv_seed(void)
 {
-    return mppt_clamp_vref((mppt.voc_est * mppt.k_focv_q8) >> 8);
+    return mppt_clamp_vref(((mppt.voc_est * mppt.k_focv_q8) >> 8)
+                           + mppt.beta_trim);
 }
 
 /* --------------------------------------------------------------------- */
@@ -201,11 +259,6 @@ void mppt_init(void)
     mppt.state          = MPPT_STATE_OFF;
     mppt.voc_est        = MPPT_VOC_NOMINAL;
     mppt.k_focv_q8      = MPPT_K_FOCV_Q8;
-    mppt.vref           = mppt_focv_seed();
-    mppt.voc_boot       = 0;
-    mppt.quiet_v_last   = 0;
-    mppt.quiet_ticks    = 0;
-    mppt.boot_voc_done  = 0;
     mppt.rpm_acc        = 0;
     mppt.rpm_acc_last   = 0;
     mppt.rpm_n          = 0;
@@ -215,41 +268,30 @@ void mppt_init(void)
     mppt.rpm_phase      = MPPT_RPM_PHASE_SETTLE;
     mppt.rpm_have_last  = 0;
     mppt.rpm_dir        = +1;
+    mppt.beta           = 0;
+    mppt.beta_trim      = 0;
+    mppt.beta_ticks     = 0;
+    mppt.beta_valid     = 0;
+    mppt.vref           = mppt_focv_seed();
+    mppt.voc_boot       = 0;
+    mppt.i_zero_raw     = 0;
+    mppt.i_zero_done    = 0;
+    mppt.quiet_v_last   = 0;
+    mppt.quiet_ticks    = 0;
+    mppt.boot_voc_done  = 0;
     mppt.duty_q12       = 0;
     mppt.duty_q12_prev  = 0;
     mppt.duty           = 0;
     mppt.i_term_q12     = 0;
-    mppt.p_last         = 0;
-    mppt.v_last         = 0;
-    mppt.i_last         = 0;
-    mppt.step           = MPPT_STEP_MIN;
-    mppt.dp_drift       = 0;
-    mppt.phase          = MPPT_PHASE_DRIFT;
-    mppt.railed         = 0;
-    mppt.dir            = +1;
-    mppt.same_dir_count = 0;
-    mppt.v_acc          = 0;
-    mppt.i_acc          = 0;
-    mppt.acc_n          = 0;
-    mppt.tick           = 0;
     mppt.recover_ticks  = 0;
     mppt.duty_applied   = 0;
-    mppt.since_sweep    = 0;
-    mppt.sweep_ticks    = 0;
-    mppt.sweep_v_last   = 0;
-    mppt.sweep_i_term   = 0;
-    mppt.sweep_settle_n = 0;
-    mppt.hill_climb     = 0;
     mppt.coasting       = 0;
     mppt.coast_events   = 0;
-    mppt.collapse_events = 0;
-    mppt.reseed_events   = 0;
-    mppt.voc_sweeps      = 0;
+    mppt.collapse_events = 0;
 
     recover_ok_ticks = 0;
     seed_ticks       = 0;
     reg_ticks        = 0;
-    hc_last          = 0;
 
     /* Prime the input filters so the first control tick is not a step.
      *
@@ -261,186 +303,13 @@ void mppt_init(void)
      * instead - see the boot-Voc block in mppt_1khz_update(). */
     mppt.v = mppt_read_volts();
     mppt.i = mppt_read_amps();
+    mppt.i_q8 = mppt.i << 8;
     for (k = 0; k < 8; k++) {
         mppt.v += (mppt_read_volts() - mppt.v) >> MPPT_V_FILTER_SHIFT;
-        mppt.i += (mppt_read_amps()  - mppt.i) >> MPPT_I_FILTER_SHIFT;
+        mppt.i_q8 += ((mppt_read_amps() << 8) - mppt.i_q8) >> MPPT_I_FILTER_SHIFT;
+        mppt.i = mppt.i_q8 >> 8;
     }
     mppt.quiet_v_last = mppt.v;
-}
-
-/* --------------------------------------------------------------------- */
-/* Tracker: dP/dV incremental conductance + Hassani two-step escalation    */
-/* --------------------------------------------------------------------- */
-/*
- * Called once every MPPT_PERIOD_TICKS ms, alternating between two slots:
- *
- *   DRIFT slot     vref is held still, so whatever the power did over this
- *                  slot was NOT caused by us. Record it, then apply the
- *                  perturbation decided at the end of the last response.
- *   RESPONSE slot  Measure the power change, subtract the drift recorded
- *                  above, and what remains is our perturbation's true
- *                  effect. Decide the next direction from that.
- *
- * So a perturbation lands every 2*MPPT_PERIOD_TICKS ms. At the default 5,
- * that is a 100 Hz perturbation rate on a 1 kHz sample stream.
- *
- * WHY THE ALTERNATION IS WORTH HALVING THE RATE (Sera's dP-P&O):
- * On an aircraft the power is almost never stationary - rolling out of a
- * bank raises irradiance continuously, and the propeller's own inertia
- * makes power drift for a second after any change. A plain hill-climber
- * sees power rise after every step, concludes every step was good,
- * escalates, and walks the reference clean off the peak into the
- * open-circuit region where the motor regenerates into the panel.
- * Measured in simulation before this was added: 50-67% tracking
- * efficiency through a roll-out, and -5 W drawn from a panel with 5.9 W
- * available. After: >98%.
- */
-
-static void mppt_tracker_step(int32_t v_avg, int32_t i_avg, uint8_t usable)
-{
-    int32_t p, dp, dv, di, dp_deadband, i_thresh, vref_before;
-    int8_t  dir;
-
-    p  = v_avg * i_avg;             /* 0.1 mW units. 60V*100A -> 6e7, safe */
-    dp = p     - mppt.p_last;
-    dv = v_avg - mppt.v_last;
-    di = i_avg - mppt.i_last;
-
-    mppt.p = p;
-
-    /* ---- is the measurement usable at all? ----
-     * Only one condition, deliberately: the PI must have authority. If duty
-     * is railed at 0 or 2000 the panel is not being held at vref by us, so
-     * nothing we measure says anything about which side of the MPP we are
-     * on. Resync the phase and bank the samples.
-     *
-     * An earlier version also gated on |v - vref| being small. That looked
-     * reasonable and was actively harmful: it fired constantly (only 55 of
-     * an expected 340 decisions survived in a 3.4 s run), desynchronised
-     * the drift/response alternation, and made tracking efficiency swing
-     * between 77% and 98% on tiny parameter changes. One condition, and
-     * let the drift subtraction do the work it is there for. */
-    if (!usable) {
-        mppt.phase          = MPPT_PHASE_DRIFT;
-        mppt.same_dir_count = 0;
-        mppt.step           = MPPT_STEP_MIN;
-        goto store;
-    }
-
-    if (mppt.phase == MPPT_PHASE_DRIFT) {
-        mppt.dp_drift = dp;
-        mppt.phase    = MPPT_PHASE_RESPONSE;
-
-        /* Apply the perturbation and remember whether vref actually moved.
-         * If the sanity clamp swallowed it we are pinned against a rail,
-         * and the response slot must not read "no change" as "we are at
-         * the MPP" - that latches the tracker against the rail for the
-         * rest of the flight. */
-        vref_before   = mppt.vref;
-        mppt.vref     = mppt_clamp_vref(mppt.vref + (int32_t)mppt.dir * mppt.step);
-        mppt.railed   = (uint8_t)(mppt.vref == vref_before);
-        goto store;
-    }
-
-    /* ================= RESPONSE SLOT ================= */
-    mppt.phase = MPPT_PHASE_DRIFT;
-
-    /* Pinned against a clamp: the only useful information is "turn around". */
-    if (mppt.railed) {
-        mppt.dir            = (int8_t)-mppt.dir;
-        mppt.step           = MPPT_STEP_MIN;
-        mppt.same_dir_count = 0;
-        goto store;
-    }
-
-    dp -= mppt.dp_drift;            /* strip the manoeuvre / inertia drift */
-
-    /* ---- irradiance-transient detection, RELATIVE to present current ----
-     * Absolute amp thresholds break at the extremes: 0.5 A is noise at full
-     * sun and is the whole output in deep shade. Percentages hold up. */
-    i_thresh = mppt.i_last;
-    if (i_thresh < 10) i_thresh = 10;          /* floor: 0.10 A */
-
-    if (iabs32(di) * 100 > (int32_t)MPPT_I_RESEED_PCT * i_thresh) {
-        /* Cloud edge or similar - far too big to walk to. Jump straight to
-         * the fractional-Voc estimate and start hill-climbing from there. */
-        mppt.vref           = mppt_focv_seed();
-        mppt.step           = MPPT_STEP_MIN;
-        mppt.same_dir_count = 0;
-        mppt.reseed_events++;
-        goto store;
-    }
-
-    if (iabs32(di) * 100 > (int32_t)MPPT_I_TRANSIENT_PCT * i_thresh) {
-        /* Moderate transient: the drift was not linear across the two
-         * slots, so the subtraction did not fully clean dp. Hold course
-         * rather than reverse on bad information. */
-        goto store;
-    }
-
-    /* ---- did the loop actually respond? ----
-     * If the commanded step produced no measurable voltage change the inner
-     * PI has not settled yet. Skip the decision - do NOT read it as
-     * "dP/dV = 0, we must be at the peak". */
-    if (iabs32(dv) < MPPT_DV_DEADBAND) {
-        goto store;
-    }
-
-    /* ---- MPP lock ----
-     * Deadband is relative (per-mille of present power) with an absolute
-     * floor, so it stays meaningful across a 10:1 irradiance swing.
-     * Per TI TIDA-010042, holding within +-2.5% of Vmpp already returns
-     * >99.5% of available power, so locking early costs almost nothing and
-     * buys a lot of stability. */
-    dp_deadband = (p / 1000) * MPPT_DP_DEADBAND_PERMILLE;
-    if (dp_deadband < MPPT_DP_DEADBAND_MIN) dp_deadband = MPPT_DP_DEADBAND_MIN;
-
-    /* ---- quantisation floor ----
-     * One ADC count of current moves dp by v * I_LSB whether or not
-     * anything physical happened. A deadband below that makes the tracker
-     * reverse on quantisation and hunt forever. On the 120 mA bench panel
-     * one count was 6.2x the relative deadband and tracking sat at 77.6%;
-     * this floor alone took it to 90.7%. Computed from the live voltage so
-     * it stays right as the operating point moves. */
-    {
-        int32_t dp_quant = (v_avg * MPPT_I_LSB_Q8 * MPPT_DP_QUANT_MULT) >> 8;
-        if (dp_deadband < dp_quant) dp_deadband = dp_quant;
-    }
-
-    if (iabs32(dp) < dp_deadband) {
-        mppt.step           = MPPT_STEP_MIN;
-        mppt.same_dir_count = 0;
-        goto store;
-    }
-
-    /* ---- direction: sign(dP/dV), computed without a division ----
-     * dP/dV > 0  =>  we are LEFT of the MPP  =>  raise vref (unload).
-     * dP/dV < 0  =>  we are RIGHT of the MPP =>  lower vref (load more). */
-    dir = ((dp > 0) == (dv > 0)) ? (int8_t)+1 : (int8_t)-1;
-
-    /* ---- Hassani two-step switcher ----
-     * MIN step while hunting; escalate to MAX after ESCALATE_COUNT moves in
-     * the same direction (we are clearly far from the peak); drop straight
-     * back to MIN the moment we overshoot and reverse. Counter-based, so it
-     * behaves identically at 5 W and at 50 W. */
-    if (dir == mppt.dir) {
-        if (mppt.same_dir_count < 255) mppt.same_dir_count++;
-        if (mppt.same_dir_count >= MPPT_ESCALATE_COUNT) {
-            mppt.step = MPPT_STEP_MAX;
-        }
-    } else {
-        mppt.step           = MPPT_STEP_MIN;
-        mppt.same_dir_count = 0;
-    }
-
-    /* Direction only. The step itself is applied at the start of the next
-     * drift slot, so that slot measures pure drift. */
-    mppt.dir = dir;
-
-store:
-    mppt.p_last = p;
-    mppt.v_last = v_avg;
-    mppt.i_last = i_avg;
 }
 
 /* --------------------------------------------------------------------- */
@@ -462,7 +331,7 @@ store:
  * have authority - if duty is railed, vref is not setting the operating
  * point and the rpm tells us nothing about k.
  */
-#if MPPT_RPM_TRACK
+#if MPPT_TRACKER == MPPT_TRACKER_RPM
 static void mppt_rpm_track(uint8_t regulating)
 {
     int32_t ect = (int32_t)e_com_time;
@@ -534,7 +403,55 @@ static void mppt_rpm_track(uint8_t regulating)
     mppt.rpm_ticks     = 0;
     mppt.rpm_input_ref = in_now;
 }
-#endif /* MPPT_RPM_TRACK */
+#endif /* MPPT_TRACKER_RPM */
+
+#if MPPT_TRACKER == MPPT_TRACKER_BETA
+/* --------------------------------------------------------------------- */
+/* Beta method: a pure I-V regulator, no perturbation                      */
+/* --------------------------------------------------------------------- */
+/*
+ *      beta = ln(I/V) - c*V,   c = 1/Vt
+ *
+ * beta at the MPP is nearly irradiance-invariant, so this drives vref until
+ * the measured beta matches that value. dbeta/dV is negative, so a beta
+ * ABOVE target means the panel is being held below Vmpp and vref must rise.
+ * Getting that sign backwards walks the setpoint straight into the
+ * short-circuit region, which is why it is spelled out here.
+ *
+ * Output is a bounded trim on the fractional-Voc seed rather than an
+ * absolute setpoint: FOCV remains the skeleton, so a bad current reading
+ * can only pull the operating point MPPT_BETA_TRIM_MAX away from a
+ * position that is already sane.
+ */
+static void mppt_beta_update(void)
+{
+    int32_t beta, err, dv;
+
+    if (mppt.i < MPPT_BETA_I_MIN || mppt.v <= 0) {
+        /* Nothing usable to compute from. Hold the trim - it is the
+         * learned part - but stop integrating on garbage. */
+        mppt.beta_valid = 0;
+        return;
+    }
+
+    /* ln(I/V) = ln(I) - ln(V). Both are raw integer units; the unit scaling
+     * is a constant offset that lives inside MPPT_BETA_MPP_Q8. */
+    beta = mppt_ln_q8((uint32_t)mppt.i) - mppt_ln_q8((uint32_t)mppt.v);
+
+    /* - c*V, with c = 1/Vt. V is in 10 mV and Vt in 10 mV, so V/Vt is the
+     * ratio directly; << 8 for Q8. */
+    beta -= ((int32_t)mppt.v << 8) / MPPT_BETA_VT;
+
+    mppt.beta       = beta;
+    mppt.beta_valid = 1;
+
+    err = beta - MPPT_BETA_MPP_Q8;      /* > 0  =>  below Vmpp  =>  raise */
+    dv  = (err * MPPT_BETA_GAIN_Q8) >> 8;
+
+    mppt.beta_trim = clamp32(mppt.beta_trim + dv,
+                             -MPPT_BETA_TRIM_MAX, MPPT_BETA_TRIM_MAX);
+}
+#endif /* MPPT_TRACKER_BETA */
 
 /* --------------------------------------------------------------------- */
 /* Inner PI voltage loop (1 kHz)                                          */
@@ -617,7 +534,21 @@ void mppt_1khz_update(void)
     i_raw = mppt_read_amps();
 
     mppt.v += (v_raw - mppt.v) >> MPPT_V_FILTER_SHIFT;
-    mppt.i += (i_raw - mppt.i) >> MPPT_I_FILTER_SHIFT;
+
+    /* Current is filtered in Q8, NOT in whole 10 mA units.
+     *
+     * y += (x - y) >> 2 has a truncation dead zone: it stops moving while
+     * 0 <= x - y <= 3, so the output settles anywhere up to 3 units BELOW
+     * the input. At a few hundred units of current that is under 1%. On this
+     * bench panel, where the whole array is ~11 units, it is up to 27% -
+     * measured 8 against a true 11.25 - and any method needing absolute
+     * current accuracy is then hopeless. Keeping 8 fractional bits of
+     * filter state drops the dead zone to 1/256 of a unit.
+     *
+     * The voltage filter is left alone: v is ~1100 units, so the same dead
+     * zone is under 0.03 V and the PI does not care. */
+    mppt.i_q8 += ((i_raw << 8) - mppt.i_q8) >> MPPT_I_FILTER_SHIFT;
+    mppt.i     = mppt.i_q8 >> 8;
 
     /* ---- 1b. boot Voc capture -----------------------------------------
      * Runs before the gating return below, so it works while disarmed -
@@ -641,14 +572,29 @@ void mppt_1khz_update(void)
         dv = mppt.v - mppt.quiet_v_last;
         if (dv < 0) dv = -dv;
 
+        /* Deliberately NOT testing mppt.i here. That reading depends on the
+         * very zero point this window exists to measure, so gating on it
+         * would be circular - a board whose CURRENT_OFFSET is wrong enough
+         * to matter would never open the window that fixes it. "Motor
+         * stopped and no duty applied" already means no motor current, and
+         * the stability test catches anything else loading the bus. */
         if (play_tone_flag == 0 && !running && mppt.duty_applied == 0 &&
-            mppt.i < MPPT_VOC_I_TH && dv < MPPT_BOOT_VOC_STABLE_DV) {
+            dv < MPPT_BOOT_VOC_STABLE_DV) {
             if (++mppt.quiet_ticks >= MPPT_BOOT_VOC_SETTLE_TICKS) {
                 if (mppt.v > MPPT_V_COLLAPSE) {
+                    /* Panel unloaded and motor stopped, so this ADC reading
+                     * IS zero amps. Worth more than any compile-time
+                     * constant: 1 mV of offset here is 7.4 mA, 6% of the
+                     * bench array. */
+                    mppt.i_zero_raw    = (int32_t)ADC_raw_current;
+                    mppt.i_zero_done   = 1;
                     mppt.voc_boot      = mppt.v;
                     mppt.voc_est       = mppt.v;
                     mppt.vref          = mppt_focv_seed();
                     mppt.boot_voc_done = 1;
+                    /* Re-prime the current filter through the new zero. */
+                    mppt.i             = mppt_read_amps();
+                    mppt.i_q8          = mppt.i << 8;
                 }
                 mppt.quiet_ticks = 0;
             }
@@ -704,15 +650,8 @@ void mppt_1khz_update(void)
         mppt.duty_q12   = 0;
         mppt.duty_q12_prev = 0;
         mppt.i_term_q12 = 0;
-        mppt.tick       = 0;
-        mppt.acc_n      = 0;
-        mppt.v_acc      = 0;
-        mppt.i_acc      = 0;
         seed_ticks      = 0;
         reg_ticks       = 0;
-        mppt.since_sweep    = 0;
-        mppt.sweep_ticks    = 0;
-        mppt.sweep_settle_n = 0;
         return;
     }
 
@@ -783,180 +722,46 @@ void mppt_1khz_update(void)
         }
         break;
 
-#if MPPT_VOC_SWEEP_INTERVAL_TICKS > 0
-    case MPPT_STATE_VOC:
-        /* ---- periodic open-circuit measurement ----
-         * Duty 0, wait for the bus to stop rising, take v as Voc. This is
-         * the only Voc source independent of the current sensor, which is
-         * what makes it usable on an array spanning 20 ADC counts.
-         *
-         * Inherently safe: unloading the panel can only raise the bus. The
-         * absolute-minimum guard above still runs first regardless.
-         *
-         * Ends on "stopped rising" rather than a fixed delay, so it costs
-         * only as long as the panel needs to charge Cbus - sub-millisecond
-         * on a healthy array, ~12 ms on the 120 mA bench panel. */
-        mppt.duty       = 0;
-        mppt.duty_q12   = 0;
-        mppt.i_term_q12 = 0;
-        mppt.sweep_ticks++;
-
-        if (iabs32(mppt.v - mppt.sweep_v_last) < MPPT_VOC_SWEEP_SETTLE_DV) {
-            mppt.sweep_settle_n++;
-        } else {
-            mppt.sweep_settle_n = 0;
-        }
-        mppt.sweep_v_last = mppt.v;
-
-        if (mppt.sweep_settle_n >= MPPT_VOC_SWEEP_SETTLE_TICKS ||
-            mppt.sweep_ticks    >= MPPT_VOC_SWEEP_MAX_TICKS) {
-            /* Direct assignment, not the IIR: this is a real measurement,
-             * not an inference. */
-            if (mppt.v > MPPT_V_COLLAPSE) mppt.voc_est = mppt.v;
-            mppt.voc_sweeps++;
-            mppt.since_sweep = 0;
-            mppt.state       = MPPT_STATE_SEED;
-            seed_ticks       = 0;
-            /* Hand the integrator back what it had, so the PI does not have
-             * to climb from zero and AM32's ramp is the only thing limiting
-             * how fast thrust returns. */
-            mppt.i_term_q12  = mppt.sweep_i_term;
-            mppt.vref        = mppt_focv_seed();
-        }
-        break;
-#endif /* MPPT_VOC_SWEEP_INTERVAL_TICKS > 0 */
 
     case MPPT_STATE_SEED:
-        /* Hold the fractional-Voc setpoint for a few ticks and let the PI
-         * settle before handing over to the hill-climber. */
+        /* Hold the fractional-Voc setpoint for a few ticks and let the inner
+         * PI settle before beta starts trimming around it. */
         mppt.vref = mppt_focv_seed();
         mppt_pi_update();
-        if (++seed_ticks >= (MPPT_PERIOD_TICKS * 2)) {
-            mppt.state          = MPPT_STATE_TRACK;
-            mppt.v_last         = mppt.v;
-            mppt.i_last         = mppt.i;
-            mppt.p_last         = mppt.v * mppt.i;
-            mppt.step           = MPPT_STEP_MIN;
-            mppt.same_dir_count = 0;
-            mppt.dir            = -1;   /* first move: load up slightly */
-            mppt.phase          = MPPT_PHASE_DRIFT;
-            mppt.railed         = 0;
-            mppt.dp_drift       = 0;
-            mppt.tick           = 0;
-            mppt.acc_n          = 0;
-            mppt.v_acc          = 0;
-            mppt.i_acc          = 0;
+        if (++seed_ticks >= MPPT_SEED_TICKS) {
+            mppt.state = MPPT_STATE_TRACK;
         }
         break;
 
     case MPPT_STATE_TRACK:
-        mppt.tick++;
-        if (mppt.since_sweep < 0xFFFFu) mppt.since_sweep++;
-
-        /* ---- time for a Voc sweep? ---- */
-#if MPPT_VOC_SWEEP_INTERVAL_TICKS > 0
-        if (mppt.since_sweep >= MPPT_VOC_SWEEP_INTERVAL_TICKS) {
-            mppt.state          = MPPT_STATE_VOC;
-            mppt.sweep_ticks    = 0;
-            mppt.sweep_settle_n = 0;
-            mppt.sweep_v_last   = mppt.v;
-            mppt.sweep_i_term   = mppt.i_term_q12;
-            break;
-        }
-#endif
-
-        /* ---- is the current channel worth listening to? ----
-         * dP/dV is inferred from current. Below MPPT_TRACK_I_MIN one ADC
-         * count is a large fraction of the reading and dp is mostly
-         * quantisation, so hill-climbing does actively worse than not
-         * trying: on the 120 mA bench panel every hill-climb tuning topped
-         * out at 86.6% while plain fractional-Voc held 96.8% dead flat.
-         * Fall back to FOCV and let the inner PI do the work. */
-#if MPPT_MODE == MPPT_MODE_FOCV
-        mppt.hill_climb = 0;
-#elif MPPT_MODE == MPPT_MODE_HILLCLIMB
-        mppt.hill_climb = 1;
-#else
-        mppt.hill_climb = (uint8_t)(mppt.i >= MPPT_TRACK_I_MIN);
-#endif
-
-        /* Mode flipped? The hill-climber's p_last/v_last/i_last are from
-         * before the FOCV interval and comparing against them would make
-         * the first decision pure noise. Resync and start clean. */
-        if (mppt.hill_climb != hc_last) {
-            hc_last             = mppt.hill_climb;
-            mppt.v_last         = mppt.v;
-            mppt.i_last         = mppt.i;
-            mppt.p_last         = mppt.v * mppt.i;
-            mppt.step           = MPPT_STEP_MIN;
-            mppt.same_dir_count = 0;
-            mppt.dir            = -1;
-            mppt.phase          = MPPT_PHASE_DRIFT;
-            mppt.railed         = 0;
-            mppt.dp_drift       = 0;
-            mppt.tick           = 0;
-            mppt.acc_n          = 0;
-            mppt.v_acc          = 0;
-            mppt.i_acc          = 0;
-        }
-
-        /* Does the PI have authority over the operating point?
-         * Must be evaluated BEFORE the fractional-Voc branch below, not
-         * after: that branch breaks out early, so leaving this where it
-         * used to sit left reg_ticks pinned at 0 in FOCV mode and the rpm
-         * tracker - which gates on it - would never have run at all. */
+        /* Does the PI have authority over the operating point? If duty is
+         * railed, vref is not setting the operating point and nothing
+         * measured here says anything about where the MPP is. */
         if (mppt.duty_q12 > 0 && mppt.duty_q12 < ((int32_t)2000 << 12)) {
             if (reg_ticks < 255) reg_ticks++;
         } else {
             reg_ticks = 0;
         }
 
-        if (!mppt.hill_climb) {
-            /* Fractional-Voc: vref is k*Voc, refreshed each tick so it
-             * follows both Voc and the rpm tracker's correction to k. The
-             * PI regulates to it fast; only k moves slowly. Nothing here
-             * perturbs on the fast path, so ADC noise has nothing to act
-             * on - the perturbation lives in the rpm tracker at ~1.7 Hz. */
-#if MPPT_RPM_TRACK
-            mppt_rpm_track((uint8_t)(reg_ticks >= MPPT_REG_TICKS));
+#if MPPT_TRACKER == MPPT_TRACKER_BETA
+        /* Pure I-V regulation, on a slow sub-multiple of the control tick.
+         * Nothing here perturbs, so there is nothing for ADC noise to act
+         * on and no steady-state dither. The loop closes around the panel
+         * curve with the inner PI inside it. */
+        if (++mppt.beta_ticks >= MPPT_BETA_PERIOD_TICKS) {
+            mppt.beta_ticks = 0;
+            if (reg_ticks >= MPPT_REG_TICKS) mppt_beta_update();
+            else                             mppt.beta_valid = 0;
+        }
+#else
+        /* Fallback for boards with no usable current sense: perturb k and
+         * keep whichever direction raises rpm. Dithers by construction -
+         * that is the price of needing no current measurement at all. */
+        mppt_rpm_track((uint8_t)(reg_ticks >= MPPT_REG_TICKS));
 #endif
-            mppt.vref  = mppt_focv_seed();
-            mppt.tick  = 0;
-            mppt.acc_n = 0;
-            mppt.v_acc = 0;
-            mppt.i_acc = 0;
-            mppt.p     = mppt.v * mppt.i;
-            mppt_pi_update();
-            break;
-        }
 
-        /* Average only the LAST few samples before a decision. The samples
-         * right after a perturbation are the inner loop's settling
-         * transient and must not be fed to the tracker (AN1521). */
-        if (mppt.tick > (MPPT_PERIOD_TICKS - MPPT_AVG_TICKS)) {
-            mppt.v_acc += mppt.v;
-            mppt.i_acc += mppt.i;
-            mppt.acc_n++;
-        }
-
-        if (mppt.tick >= MPPT_PERIOD_TICKS) {
-            /* Divide by the CONSTANT, not by acc_n. Every other division in
-             * this module is by a compile-time constant, which the compiler
-             * strength-reduces to a multiply-high plus shift; a division by
-             * a runtime variable would be the only real SDIV in the whole
-             * hot path. Requiring a full accumulator also throws away
-             * decisions built on partial data. */
-            if (mppt.acc_n == MPPT_AVG_TICKS) {
-                mppt_tracker_step(mppt.v_acc / MPPT_AVG_TICKS,
-                                  mppt.i_acc / MPPT_AVG_TICKS,
-                                  (uint8_t)(reg_ticks >= MPPT_REG_TICKS));
-            }
-            mppt.tick  = 0;
-            mppt.acc_n = 0;
-            mppt.v_acc = 0;
-            mppt.i_acc = 0;
-        }
-
+        mppt.vref = mppt_focv_seed();     /* seed + beta's learned trim */
+        mppt.p    = mppt.v * mppt.i;      /* telemetry only */
         mppt_pi_update();
         break;
 

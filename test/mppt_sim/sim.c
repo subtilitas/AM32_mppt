@@ -14,13 +14,13 @@ extern char play_tone_flag;
 
 /* ~12 V Voc array, sized to what EGAN_MPPT_L431 can actually measure. */
 #ifndef VOC_STC
-#define VOC_STC 12.0
+#define VOC_STC 13.4
 #endif
 #ifndef ISC_STC
-#define ISC_STC  3.0
+#define ISC_STC  0.120
 #endif
 #ifndef VTH
-#define VTH      0.672
+#define VTH      0.75
 #endif
 /* TRUE hardware sense gain - NOT MILLIVOLT_PER_AMP, which this board
  * deliberately mis-sets so DShot telemetry reads non-zero. */
@@ -74,6 +74,12 @@ static double irradiance(double t){
 #endif
 /* SHADE_AT>0 drops irradiance to 4% for SHADE_MS, to force a bus collapse and
  * exercise the RECOVER / absolute-minimum unload path. */
+/* Overall irradiance level, 1.0 = full sun. THE axis that matters: a large
+ * array in low light behaves like a small array in full sun, so there is no
+ * such thing as a "small panel case" separate from a "low light case". */
+#ifndef G_SCALE
+#define G_SCALE 1.0
+#endif
 #ifndef SHADE_AT
 #define SHADE_AT 0.0
 #endif
@@ -88,12 +94,12 @@ int main(void){
     double dt=2e-6, T=TSIM; long N=(long)(T/dt);
     double tick_dt = 1.0/(double)MPPT_TICK_HZ; long td=(long)(tick_dt/dt);
     double v=VOC_STC, im=0, w=0, zcacc=0;
-    uint16_t am32=0, pv=adc_v(VOC_STC), pi=adc_i(0);
+    uint16_t am32=0, d_prev=0, pv=adc_v(VOC_STC), pi=adc_i(0);
     VOLTAGE_DIVIDER=TARGET_VOLTAGE_DIVIDER; armed=0; running=0; input=0; prop_brake_active=0;
     ADC_raw_volts=pv; ADC_raw_current=pi; mppt_init();
     double harv=0, avail=0, vmin=1e9, dutymin=1e9, regen=0, wmin=1e9, wref=0; long bo=0;
     for(long n=0;n<N;n++){
-        double t=n*dt, G=irradiance(t);
+        double t=n*dt, G=irradiance(t)*G_SCALE;
         if(SHADE_AT>0.0 && t>SHADE_AT && t<SHADE_AT+SHADE_MS/1000.0) G=SHADE_G;
         if(t>0.05){armed=1;running=1;input=2047;}
         zcacc += 6.0*7.0*(w/(2*M_PI))*dt; if(!armed||!running) zcacc=0;
@@ -104,10 +110,15 @@ int main(void){
             e_com_time = (zero_crosses<24 || erps<1.0) ? 65408 : (int)(1e6/erps + 0.5);
         }
         if(n%td==0){ ADC_raw_volts=pv; ADC_raw_current=pi; mppt_1khz_update();
-            pv=adc_v(v); pi=adc_i((am32/2000.0)*im);
+            /* Bus current is the APPLIED duty times motor current. Sampling
+             * am32 here instead - AM32's unclamped intent, which ramps to
+             * 2000 and stays - fed the firmware ~6x the real bus current and
+             * made every absolute-current threshold meaningless. d_prev is
+             * last tick's applied duty, which is what the shunt actually saw. */
+            pv=adc_v(v); pi=adc_i((d_prev/2000.0)*im);
             if(armed&&running){ if(am32<2000) am32+=20; } else am32=0; }
         h_all_off=0;
-        uint16_t d=am32; mppt_apply_duty(&d); double D=d/2000.0;
+        uint16_t d=am32; mppt_apply_duty(&d); d_prev=d; double D=d/2000.0;
         double ib, dim;
         if(h_all_off){
             /* COASTING - all six FETs off. The winding is open, so no current
@@ -132,8 +143,8 @@ int main(void){
             if(t>1.0&&d<dutymin)dutymin=d; if(ib<regen)regen=ib;
             if(SHADE_AT>0.0){ if(t<SHADE_AT) wref=w; else if(w<wmin) wmin=w; } }
     }
-    fprintf(stderr,"T=%4.1fs eff=%6.2f%%  vmin=%5.2fV  brownout=%ld  min_duty(t>1s)=%4.0f  worst_regen=%6.3fA  collapses=%u reseeds=%u",
-        T,100.0*harv/avail,vmin,bo,dutymin,regen,mppt.collapse_events,mppt.reseed_events);
+    fprintf(stderr,"T=%4.1fs eff=%6.2f%%  vmin=%5.2fV  brownout=%ld  min_duty(t>1s)=%4.0f  worst_regen=%6.3fA  collapses=%u",
+        T,100.0*harv/avail,vmin,bo,dutymin,regen,mppt.collapse_events);
     if(SHADE_AT>0.0) fprintf(stderr,"  rpm_kept=%5.1f%% coast_events=%u", wmin<1e8?100.0*wmin/wref:100.0, mppt.coast_events);
     fprintf(stderr,"\n");
     return 0;
