@@ -1,0 +1,99 @@
+name: MPPT build
+
+# Deliberately a SEPARATE workflow from CICD_build.yml, which is upstream
+# AM32's and is left untouched so this fork stays easy to rebase.
+#
+# Two jobs:
+#   host-tests  - the sim and directed tests. No toolchain, ~30 s.
+#   build-mppt  - cross-build every buildable board with MPPT force-enabled,
+#                 each with the tracker it can actually support. A
+#                 portability and flash-budget gate.
+#
+# Tracker per board, decided by test/mppt_targets.sh from targets.h:
+#
+#   board declares its own MILLIVOLT_PER_AMP  -> MPPT_TRACKER_BETA  (112)
+#   inherits the fabricated 20 mV/A fallback  -> MPPT_TRACKER_RPM   (136)
+#
+# The fallback matters because targets.h ends with
+# `#ifndef MILLIVOLT_PER_AMP / #define ... 20`, so a board with no shunt
+# still reports a current - an invented one. Beta drives the setpoint from
+# ln(I/V) and walks vref into a clamp rail on that; the rpm tracker needs no
+# current at all.
+
+on:
+  push:
+    branches: ["**"]
+    tags: ['v[0-9]+.[0-9]+']
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  host-tests:
+    name: Host tests (sim + directed)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Directed tests, both trackers (UBSan + ASan)
+        run: |
+          set -e
+          echo "=== MPPT_TRACKER_BETA ==="; ./test/mppt_sim/run.sh test
+          echo "=== MPPT_TRACKER_RPM ===";  TRACKER=RPM ./test/mppt_sim/run.sh test
+
+      - name: Plant model across irradiance, both trackers
+        run: |
+          set -e
+          for trk in BETA RPM; do
+            for g in 1.0 0.60 0.35; do
+              printf '%-5s G=%-5s ' "$trk" "$g"
+              TRACKER=$trk G=$g ./test/mppt_sim/run.sh 60
+            done
+          done
+
+      - name: Bus collapse path
+        run: EXTRA="-DSHADE_AT=5.0 -DSHADE_G=0.001" ./test/mppt_sim/run.sh 8
+
+  build-mppt:
+    name: Cross-build, MPPT enabled
+    runs-on: ubuntu-latest
+    needs: host-tests
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: 'recursive'
+
+      - name: Install ARM toolchain
+        run: make arm_sdk_install
+
+      - name: Tracker assignment per board
+        run: ./test/mppt_targets.sh --report
+
+      - name: Build every board with USE_MPPT and its tracker
+        run: ./test/build_mppt_all.sh -j2 | tee build_summary.txt
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo '### MPPT build'
+            echo
+            echo '```'
+            tail -n 130 build_summary.txt
+            echo '```'
+            echo
+            echo 'Green means it compiles, links and fits. It does **not** mean'
+            echo 'flight-ready: `MPPT_BETA_MPP_Q8` and `MPPT_BETA_VT` are'
+            echo 'panel-specific, and the safety thresholds must come from the'
+            echo "board's own regulator dropout. Only EGAN_MPPT_L431 is"
+            echo 'characterised.'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Archive MPPT firmware
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: AM32-MPPT-binaries
+          path: |
+            obj/*.hex
+            build_summary.txt
+          retention-days: 60

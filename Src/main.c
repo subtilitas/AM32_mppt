@@ -230,6 +230,7 @@ an settings option)
 #include "signal.h"
 #include "sounds.h"
 #include "targets.h"
+#include "mppt.h"   /* must follow targets.h - USE_MPPT is set per board */
 #include <stdint.h>
 #include <string.h>
 #include <assert.h>
@@ -1455,6 +1456,10 @@ void tenKhzRoutine()
                     speedPid.integral = 0;
                 }
             }
+            /* Solar MPPT control tick. Last in this block so it sees the
+             * settled results of everything above it. No-op unless the
+             * board defines USE_MPPT. */
+            mppt_1khz_update();
         }
         if (ramp_count > ramp_divider) {
           ramp_count = 0;
@@ -1491,6 +1496,23 @@ void tenKhzRoutine()
              duty_cycle = last_duty_cycle;
             }
 
+        /* AM32's ramp state is captured BEFORE the MPPT ceiling is applied,
+         * so the ramp tracks AM32's own intent rather than the clamped
+         * value. Otherwise every MPPT duty reduction resets the ramp and
+         * AM32 has to crawl back up at max_duty_cycle_change per tick -
+         * with RAMP_SPEED_* = 1 that is 1 duty unit per 20 kHz tick, so a
+         * 26 ms Voc sweep cost 78 ms of recovery instead of 28 ms.
+         * The MPPT's own PI is what rate-limits the ceiling coming back;
+         * it is anti-windup clamped, so nothing steps. */
+        last_duty_cycle = duty_cycle;
+
+        /* Solar MPPT duty ceiling. Deliberately AFTER the ramp/slew block
+         * above: a bus collapse has to be caught in one tick, and AM32's
+         * ramp rate of a few duty units per step would take ~100 ms to shed
+         * load. Reductions therefore bypass the slew limiter; increases
+         * still go through it. No-op unless USE_MPPT. */
+        mppt_apply_duty(&duty_cycle);
+
         if ((armed && running) && input > 47) {
             if (eepromBuffer.variable_pwm) {
             }
@@ -1509,7 +1531,7 @@ void tenKhzRoutine()
             }
             }
         }
-        last_duty_cycle = duty_cycle;
+        /* last_duty_cycle is assigned above, before the MPPT ceiling. */
         SET_AUTO_RELOAD_PWM(tim1_arr);
         SET_DUTY_CYCLE_ALL(adjusted_duty_cycle);
     }
@@ -1891,6 +1913,13 @@ int main(void)
   minimum_duty_cycle = minimum_duty_cycle + 50 + ((eepromBuffer.pwm_frequency * 50 )/24);
   startup_max_duty_cycle = startup_max_duty_cycle + 400;
 #endif
+
+    /* Solar MPPT init. Deliberately the last thing before the main loop:
+     * by this point the ADC DMA has been running for the whole startup
+     * tune, so ADC_raw_volts is live, and duty is still 0 with the panel
+     * open-circuit - which hands mppt_init() a real Voc measurement for
+     * free. No-op unless the board defines USE_MPPT. */
+    mppt_init();
 
     while (1) {
 if(zero_crosses < 24){
