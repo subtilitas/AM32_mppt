@@ -12,7 +12,7 @@ extern int h_all_off;   /* set by the harness when mppt.c calls allOff() */
 extern int e_com_time;
 extern char play_tone_flag;
 
-/* ~12 V Voc array, sized to what EGAN_MPPT_L431 can actually measure. */
+/* ~12 V Voc array, sized to what EGAN_JUWI_L431 can actually measure. */
 /* SunPower back-contact cells, the usual RC choice: 0.71 V Voc and 0.62 V
  * Vmpp per cell, which implies a 28.9 mV per-cell diode voltage. The plant
  * must model the SAME cell the firmware assumes, or the beta target is

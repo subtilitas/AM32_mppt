@@ -27,7 +27,7 @@
 #     volatile uint32_t, and that mismatch hid a real in-flight duty collapse.
 #
 #  2. HW_MVA is the TRUE sense-amp gain in mV/A. It is deliberately NOT
-#     MILLIVOLT_PER_AMP: on EGAN_MPPT_L431 that constant is mis-set to make
+#     MILLIVOLT_PER_AMP: on EGAN_JUWI_L431 that constant is mis-set to make
 #     DShot telemetry readable on a sub-amp panel. The plant must model the
 #     hardware, not the firmware's belief about it.
 #
@@ -40,7 +40,7 @@ cd "$(dirname "$0")"
 ROOT=../..
 T=${1:-3.4}
 [ "$T" = "test" ] || [ "$T" = "coast" ] && T=3.4
-BOARD=${BOARD:-EGAN_MPPT_L431}
+BOARD=${BOARD:-EGAN_JUWI_L431}
 HW_MVA=${HW_MVA:-136}
 OUT=$(mktemp -d)
 trap 'rm -rf "$OUT"' EXIT

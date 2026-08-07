@@ -15,14 +15,15 @@ Files: `Src/mppt.c`, `Inc/mppt.h`, regression harness in `test/mppt_sim/`.
 ## 1. Enabling it
 
 The module is **off** unless the board's block in `Inc/targets.h` defines
-`USE_MPPT`. Today only `EGAN_MPPT_L431` does.
+`USE_MPPT`. `EGAN_JUWI_L431` does; CI force-enables it on every other
+buildable board (see §5).
 
 When it is off, `Src/mppt.c` compiles to a single typedef and the three call
 sites in `Src/main.c` preprocess to `((void)0)` via macros at the bottom of
 `mppt.h`. Every other target in the tree is unaffected, byte for byte.
 
 ```c
-#ifdef EGAN_MPPT_L431
+#ifdef EGAN_JUWI_L431
 ...
 #define USE_MPPT
 #endif
@@ -154,7 +155,7 @@ against 0.210 V / 0.596 V for the rpm tracker.
 ADC counts, β stops being computable, and the code falls back to plain
 fractional-Voc while *holding* the trim it last learned (verified: the trim
 survives a cloud edge unchanged). That floor is a property of the sense
-chain, not the algorithm. See the crossover table in §7 item 7 — the rpm tracker still works down there
+chain, not the algorithm. See the crossover table in §7 item 6 — the rpm tracker still works down there
 and is the better fallback if you can tolerate its dither.
 
 **Calibration — two numbers.** `MPPT_CELLS` and `MPPT_ARRAY_ISC`. Everything
@@ -242,7 +243,7 @@ measurement.
 
 ---
 
-## 4. Cost on EGAN_MPPT_L431
+## 4. Cost on EGAN_JUWI_L431
 
 - **RAM:** 87 bytes total (`mppt_t` plus 3 static bytes).
 - **Flash:** ~3.2 kB (measured 3312 B of x86-64 `.text`; Thumb-2 is smaller).
@@ -270,7 +271,7 @@ in full sun.
 |---|---|
 | β, full sun, 60 s | 99.91%, 0 brownouts, `vref` 0.000 V p-p |
 | β at 60% / 35% irradiance | 99.89% / 99.72% |
-| β below 25% irradiance | drops out, falls back to fixed-k holding its trim — see §7 item 7 |
+| β below 25% irradiance | drops out, falls back to fixed-k holding its trim — see §7 item 6 |
 | rpm P&O, same runs | 99.64% / 99.29% / 98.30%, but 0.210 V p-p dither |
 | fixed k=0.781, same runs | 96.74% / 92.49% / 89.95% |
 | β target constant across 3:1 irradiance | −5022 / −5022 / −5023 |
@@ -284,7 +285,7 @@ in full sun.
 | int32 overflow audit, all arithmetic paths | worst case 79.3% of `INT32_MAX` |
 
 **Not verified:** nothing has been cross-compiled with `arm-none-eabi-gcc` or
-run on hardware. Build `make EGAN_MPPT_L431` yourself before trusting any of
+run on hardware. Build `make EGAN_JUWI_L431` yourself before trusting any of
 the flash/RAM/cycle numbers above.
 
 Keep Cbus in roughly the 100–1000 µF band. The 2200 µF failure is a real
@@ -574,10 +575,7 @@ These are **not** fixed. They need hardware, not more simulation.
    **5.85 A**. Negative current clamps to 0, meaning regeneration is invisible
    to the tracker. Check that 5.85 A is above your worst-case draw.
 
-6. **`MPPT_VOLTAGE_OFFSET 6`** in the `EGAN_MPPT_L431` block is referenced
-   nowhere in the tree. Left in place, but it does nothing.
-
-7. **β dies below ~25% irradiance, and the rpm tracker does not.** Measured
+6. **β dies below ~25% irradiance, and the rpm tracker does not.** Measured
    over 60 s on one panel:
 
    | irradiance | β | rpm P&O | fixed k |
@@ -594,7 +592,7 @@ These are **not** fixed. They need hardware, not more simulation.
    ±0.21 V dither. Using the rpm tracker as the low-light fallback instead
    of fixed-k is the obvious improvement and is not implemented.
 
-8. **Right shifts of negative values.** The IIR filters rely on `>>` being
+7. **Right shifts of negative values.** The IIR filters rely on `>>` being
    arithmetic, which GCC guarantees but ISO C does not. It also biases the
    filter output low by under 40 mV / 40 mA. Harmless, but do not "clean up"
    the shifts into divisions without re-checking the tuning.

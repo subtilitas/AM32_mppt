@@ -29,7 +29,7 @@
  *    below ~25% irradiance where beta goes blind. Removed because it
  *    oscillates by construction: +-0.21 V on vref, forever. That is the
  *    dither beta exists to eliminate. The measured crossover is in
- *    doc/MPPT.md section 7, item 7, if you ever want it back.
+ *    doc/MPPT.md section 7, item 6, if you ever want it back.
  *
  * ---------------------------------------------------------------------
  * PI TUNING RECIPE (do this on the bench, prop off, panel or PSU+resistor)

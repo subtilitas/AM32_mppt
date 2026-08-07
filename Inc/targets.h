@@ -86,55 +86,6 @@
 #define USE_INTERNAL_AMP
 #endif
 
-#ifdef EGAN_MPPT_L431
-#define FIRMWARE_NAME "AM32MPPTL431"
-#define FILE_NAME "EGAN_MPPT_L431"
-#define DEAD_TIME 1
-#define HARDWARE_GROUP_L4_B
-#define TARGET_VOLTAGE_DIVIDER 47
-#define MILLIVOLT_PER_AMP 13
-#define CURRENT_OFFSET 2500
-#define USE_SERIAL_TELEMETRY
-#define EEPROM_START_ADD (uint32_t)0x0800F800
-/* Solar MPPT tracker - see Inc/mppt.h and doc/MPPT.md.
- * This is the only target in the tree that enables it; every other board
- * compiles Src/mppt.c to nothing and is unaffected.
- *
- * NOTE ON SCALING: TARGET_VOLTAGE_DIVIDER 47 above means the firmware can
- * only measure up to 3300 mV * 4.7 = 15.51 V of bus. mppt.h is therefore
- * scaled for a ~12 V Voc array, NOT the 24 V array the module was written
- * against. A _Static_assert in mppt.h enforces the relationship.
- *
- * THE SAFETY THRESHOLDS BELOW ARE PLACEHOLDERS. Set MPPT_V_COLLAPSE and
- * MPPT_V_ABSOLUTE_MIN from this board's actual 3.3 V regulator dropout plus
- * margin before the first flight - with no battery on the bus they are the
- * only thing keeping the MCU alive. */
-#ifndef USE_MPPT          /* guard: CI force-enables it from the command line */
-#define USE_MPPT
-#endif
-
-/* *** THE TRUE SENSE-CHAIN GAIN. ***
- * MILLIVOLT_PER_AMP above is deliberately mis-set to 13 (real value 136) so
- * that DShot telemetry, which reports whole amps, shows something other than
- * 0 on a sub-amp bench panel. That inflates the reported current ~10x. Fine
- * for a display; wrong for a control loop, whose absolute current thresholds
- * would then be in fictional amps. The MPPT uses this constant instead, so
- * the two paths do not have to agree. */
-#define MPPT_MILLIVOLT_PER_AMP 136
-
-/* Array nameplate. Declare the CELL COUNT, not the voltage: mppt.h derives
- * Voc, Vmpp, the Vmpp/Voc ratio, the diode voltage and both safety
- * thresholds from it, and they cannot then disagree with each other.
- * 19 SunPower cells = 13.49 V Voc, which is the 13.4 V bench panel.
- * CHANGE BOTH FOR THE FLIGHT ARRAY. */
-#define MPPT_CELLS              19    /* series cells                    */
-#define MPPT_ARRAY_ISC          12    /*  0.12 A Isc at STC, 10 mA       */
-
-/* Safety thresholds - PLACEHOLDERS, see above. */
-/* #define MPPT_V_COLLAPSE        700 */  /* enter RECOVER, 10 mV         */
-/* #define MPPT_V_ABSOLUTE_MIN    550 */  /* force duty 0, 10 mV          */
-#endif
-
 #ifdef EGAN_JUWI_L431
 #define FIRMWARE_NAME "EganJuwiL431"
 #define FILE_NAME "EGAN_JUWI_L431"
@@ -145,6 +96,36 @@
 #define CURRENT_OFFSET 2500
 #define USE_SERIAL_TELEMETRY
 #define EEPROM_START_ADD (uint32_t)0x0800F800
+
+/* Solar maximum power point tracking - see Inc/mppt.h and doc/MPPT.md.
+ * There is no separate MPPT variant of this board any more: every build from
+ * this repository is an MPPT build, so the tracker lives in the one target
+ * rather than in a near-duplicate of it. */
+#ifndef USE_MPPT          /* guard: CI force-enables it from the command line */
+#define USE_MPPT
+#endif
+
+/* *** THE TRUE SENSE-CHAIN GAIN. ***
+ * MILLIVOLT_PER_AMP above is deliberately mis-set so that DShot telemetry,
+ * which reports whole amps, shows something other than 0 on a sub-amp panel.
+ * That inflates the reported current ~10x. Fine for a display; wrong for a
+ * control loop, whose absolute current thresholds would then be in fictional
+ * amps. The tracker uses this constant instead, so the two paths do not have
+ * to agree. */
+#define MPPT_MILLIVOLT_PER_AMP 136
+
+/* Array nameplate. Declare the CELL COUNT, not the voltage: mppt.h derives
+ * Voc, Vmpp, the Vmpp/Voc ratio, the diode voltage, both safety thresholds
+ * and beta's target from it, and they cannot then disagree with each other.
+ * 19 SunPower cells = 13.49 V Voc, which is the bench panel.
+ * CHANGE BOTH FOR THE FLIGHT ARRAY. */
+#define MPPT_CELLS              19    /* series cells                     */
+#define MPPT_ARRAY_ISC          12    /*  0.12 A Isc at STC, 10 mA        */
+
+/* MPPT_V_REG_MIN defaults to 4.30 V in mppt.h. It is the one number about
+ * the BOARD rather than the panel - the lowest bus voltage at which its
+ * 3.3 V rail still regulates, and so how far the bus may sag before the ESC
+ * brown-out resets. Measure it and override here. */
 #endif
 
 #ifdef VIMDRONES_L431

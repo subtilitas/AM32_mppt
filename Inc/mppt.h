@@ -72,7 +72,7 @@
  * Past that the ADC rails at 0x0FFF and every voltage in this file becomes
  * meaningless. MPPT_ADC_FULL_SCALE_V below is that number, and the static
  * assertions at the bottom of this header check the configuration against
- * it at compile time. On EGAN_MPPT_L431 (divider 47) it is 15.51 V, which
+ * it at compile time. On EGAN_JUWI_L431 (divider 47) it is 15.51 V, which
  * is why this file is scaled for a ~12 V array and not the 24 V array the
  * module was originally written against.
  *
@@ -750,7 +750,7 @@ _Static_assert(MPPT_COAST_EXIT_DUTY > MPPT_COAST_DUTY_TH,
  * catch the moment the tracker reaches Voc AND high enough to sit above
  * the sense chain's own offset uncertainty.
  *
- * On EGAN_MPPT_L431 the sense amp is bidirectional (CURRENT_OFFSET 2500,
+ * On EGAN_JUWI_L431 the sense amp is bidirectional (CURRENT_OFFSET 2500,
  * MILLIVOLT_PER_AMP 136), so 1 mV of offset drift moves the reading by
  * 100/136 = 0.74 in these units, i.e. ~7.4 mA per mV. A 10 mV offset error
  * is therefore 0.074 A, which alone would swamp the original 0.08 A
@@ -874,7 +874,7 @@ rather than silently mis-scaled by 16x."
  * The MPPT does its own current conversion and does NOT have to share
  * MILLIVOLT_PER_AMP with AM32's telemetry path.
  *
- * This matters on EGAN_MPPT_L431. DShot telemetry reports current in whole
+ * This matters on EGAN_JUWI_L431. DShot telemetry reports current in whole
  * amps, so a sub-amp bench panel reads as a flat 0 A; MILLIVOLT_PER_AMP is
  * deliberately mis-set (13 instead of the true 136) to inflate the reading
  * ~10x and make it visible. That is a fine thing to do to a display. It is
@@ -889,7 +889,7 @@ rather than silently mis-scaled by 16x."
 #endif
 
 /* One ADC count of current, in 10 mA units, Q8 (value/256).
- * EGAN_MPPT_L431 at the true 136 mV/A: 151/256 = 0.59, i.e. 5.9 mA. */
+ * EGAN_JUWI_L431 at the true 136 mV/A: 151/256 = 0.59, i.e. 5.9 mA. */
 #define MPPT_I_LSB_Q8 \
     ((MPPT_ADC_VREF_MV * 256) / (MPPT_I_SCALE_DIV * MPPT_MILLIVOLT_PER_AMP))
 

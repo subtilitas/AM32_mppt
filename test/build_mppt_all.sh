@@ -18,7 +18,7 @@
 #   Validation. A green build does not mean the firmware is flight-ready on
 #   that board: MPPT_BETA_MPP_Q8 and MPPT_BETA_VT are panel-specific, and
 #   MPPT_V_COLLAPSE / MPPT_V_ABSOLUTE_MIN must come from the board's own
-#   regulator dropout. Only EGAN_MPPT_L431 has been characterised.
+#   regulator dropout. Only EGAN_JUWI_L431 has been characterised.
 #
 # Target selection is derived from Inc/targets.h at run time by
 # mppt_targets.sh, never hard-coded, so it stays correct as boards are added.

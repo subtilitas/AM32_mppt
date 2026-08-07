@@ -85,11 +85,11 @@ Measured against a PV + bus-capacitor + BLDC + propeller plant model, 60 s:
 | 20% | 87.35% | **97.56%** |
 | 10% | 88.87% | **98.62%** |
 
-Cost on EGAN_MPPT_L431: ~3.4 kB flash, 111 bytes RAM.
+Cost on EGAN_JUWI_L431: ~3.4 kB flash, 111 bytes RAM.
 
 ## Before you fly it
 
-Only `EGAN_MPPT_L431` has been characterised. For any other board:
+Only `EGAN_JUWI_L431` has been characterised. For any other board:
 
 - Set `MPPT_CELLS` and `MPPT_ARRAY_ISC` for your wing.
 - `MPPT_V_REG_MIN` is the one number about the **board**, not the panel: the
