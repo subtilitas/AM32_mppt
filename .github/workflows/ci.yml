@@ -1,0 +1,136 @@
+name: CI
+
+# THE ONLY CI IN THIS FORK. It replaces upstream AM32's CICD_build.yml,
+# which built every target with MPPT off - a configuration this repository
+# does not ship and nobody should flash off it. Keeping both would have made
+# the green tick on a non-MPPT build the first thing a visitor saw.
+#
+#   host-tests  sim and directed tests, both trackers, under UBSan/ASan.
+#               No toolchain, ~30 s. Everything else is gated behind it.
+#   build       cross-build every buildable board with MPPT force-enabled
+#               and the tracker that board can support. Split by MCU family
+#               so the families run in parallel: serially it is 248 full
+#               rebuilds in one job, and F421 alone is 103 of them.
+#   release     on a version tag, collect every family's hex into one
+#               GitHub release. This is the part carried over from the
+#               workflow being replaced.
+#
+# Tracker per board, decided by test/mppt_targets.sh from targets.h:
+#
+#   board declares its own MILLIVOLT_PER_AMP  -> MPPT_TRACKER_BETA  (112)
+#   inherits the fabricated 20 mV/A fallback  -> MPPT_TRACKER_RPM   (136)
+#
+# The fallback matters because targets.h ends with
+# `#ifndef MILLIVOLT_PER_AMP / #define ... 20`, so a board with no shunt
+# still reports a current - an invented one. Beta drives the setpoint from
+# ln(I/V) and walks vref into a clamp rail on that; the rpm tracker needs no
+# current at all.
+
+on:
+  push:
+    branches: ["**"]
+    tags: ['v[0-9]+.[0-9]+']
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  host-tests:
+    name: Host tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Directed tests, both trackers (UBSan + ASan)
+        run: |
+          set -e
+          echo "=== MPPT_TRACKER_BETA ==="; ./test/mppt_sim/run.sh test
+          echo "=== MPPT_TRACKER_RPM ===";  TRACKER=RPM ./test/mppt_sim/run.sh test
+
+      - name: Plant model across irradiance, both trackers
+        run: |
+          set -e
+          for trk in BETA RPM; do
+            for g in 1.0 0.60 0.35; do
+              printf '%-5s G=%-5s ' "$trk" "$g"
+              TRACKER=$trk G=$g ./test/mppt_sim/run.sh 60
+            done
+          done
+
+      - name: Plant model across cell count
+        run: |
+          set -e
+          for c in 10 12 14 16 19; do
+            printf 'CELLS=%-3s ' "$c"
+            CELLS=$c ./test/mppt_sim/run.sh 60
+          done
+
+      - name: Bus collapse path
+        run: EXTRA="-DSHADE_AT=5.0 -DSHADE_G=0.001" ./test/mppt_sim/run.sh 8
+
+      - name: Tracker assignment per board
+        run: ./test/mppt_targets.sh --report
+
+  build:
+    name: ${{ matrix.mcu }}
+    needs: host-tests
+    runs-on: ubuntu-latest
+    strategy:
+      # One family's failure must not cancel the rest: the point of this job
+      # is the complete list of what does not fit, not the first one.
+      fail-fast: false
+      matrix:
+        mcu: [F421, G071, F051, L431, F415, E230, G431, F031, V203, G031]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: 'recursive'
+
+      - name: Install ARM toolchain
+        run: make arm_sdk_install
+
+      - name: Build ${{ matrix.mcu }} with MPPT enabled
+        run: ./test/build_mppt_all.sh --mcu ${{ matrix.mcu }} -j4 | tee build_${{ matrix.mcu }}.txt
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### ${{ matrix.mcu }}"
+            echo '```'
+            cat build_${{ matrix.mcu }}.txt 2>/dev/null || echo '(no output)'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: AM32-MPPT-${{ matrix.mcu }}
+          path: |
+            obj/*.hex
+            build_${{ matrix.mcu }}.txt
+          retention-days: 60
+          if-no-files-found: warn
+
+  release:
+    name: Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: AM32-MPPT-*
+          merge-multiple: true
+          path: release
+
+      - name: Publish
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release/*.hex
+          body: |
+            MPPT firmware. **Do not flash on a battery-powered ESC** - see the
+            README. Every binary here regulates the input bus to a solar
+            panel's maximum-power voltage and will shed throttle when the bus
+            sags, which on a battery is wrong in every direction.
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

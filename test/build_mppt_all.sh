@@ -3,6 +3,7 @@
 #
 #   ./test/build_mppt_all.sh          # build them all, summary table, non-zero on failure
 #   ./test/build_mppt_all.sh -j4      # pass extra flags through to make
+#   ./test/build_mppt_all.sh --mcu F051 -j4   # one MCU family (CI runs these in parallel)
 #
 # Requires the ARM toolchain: run `make arm_sdk_install` first.
 #
@@ -23,7 +24,14 @@
 # mppt_targets.sh, never hard-coded, so it stays correct as boards are added.
 set -u
 cd "$(dirname "$0")/.."
-EXTRA_MAKE_ARGS=("$@")
+MCU_FILTER=""
+EXTRA_MAKE_ARGS=()
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --mcu) MCU_FILTER="$2"; shift 2 ;;
+        *)     EXTRA_MAKE_ARGS+=("$1"); shift ;;
+    esac
+done
 
 command -v arm-none-eabi-gcc >/dev/null 2>&1 || {
     if [ -d tools ]; then export PATH="$PATH:$(echo tools/*/bin | tr ' ' ':')"; fi
@@ -33,9 +41,14 @@ command -v arm-none-eabi-size >/dev/null 2>&1 || {
     exit 2
 }
 
-mapfile -t PAIRS < <(./test/mppt_targets.sh)
-echo "MPPT-eligible targets: ${#PAIRS[@]}"
-./test/mppt_targets.sh --report | sed -n '/^excluded/,$p' | sed 's/^/  /'
+if [ -n "$MCU_FILTER" ]; then
+    mapfile -t PAIRS < <(./test/mppt_targets.sh --mcu "$MCU_FILTER")
+    echo "MPPT-eligible ${MCU_FILTER} targets: ${#PAIRS[@]}"
+else
+    mapfile -t PAIRS < <(./test/mppt_targets.sh)
+    echo "MPPT-eligible targets: ${#PAIRS[@]}"
+fi
+[ -n "$MCU_FILTER" ] || ./test/mppt_targets.sh --report | sed -n '/^excluded/,$p' | sed 's/^/  /'
 echo
 
 # One make invocation per target: slower than `make all`, but it gives a

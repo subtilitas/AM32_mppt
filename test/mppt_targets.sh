@@ -5,6 +5,7 @@
 #   ./mppt_targets.sh --beta     # only the beta-capable targets
 #   ./mppt_targets.sh --rpm      # only the rpm-fallback targets
 #   ./mppt_targets.sh --report   # both lists plus exclusions, with reasons
+#   ./mppt_targets.sh --mcu F051 # only that MCU family (used by CI's matrix)
 #
 # THE SELECTION RULE, AND WHY IT IS NOT "ALL TARGETS"
 #
@@ -41,6 +42,9 @@ python3 - "$@" <<'PY'
 import re, sys
 report = '--report' in sys.argv
 only   = 'beta' if '--beta' in sys.argv else ('rpm' if '--rpm' in sys.argv else None)
+mcu    = None
+if '--mcu' in sys.argv:
+    mcu = sys.argv[sys.argv.index('--mcu') + 1].upper()
 src = open('Inc/targets.h', encoding='utf-8', errors='replace').read()
 src = src.replace('\r\n', '\n').split('\n')
 
@@ -75,6 +79,8 @@ for name, (defs, fname) in sorted(blocks.items()):
         excluded.append((fname, 'not a buildable make target')); continue
     if 'A153' in fname:
         excluded.append((fname, 'NXP MCXA - 16-bit ADC, current staging unsupported')); continue
+    if mcu and ('_' + mcu) not in fname:
+        continue
     tracker = 'BETA' if 'MILLIVOLT_PER_AMP' in defs else 'RPM'
     eligible.append((fname, tracker))
 
