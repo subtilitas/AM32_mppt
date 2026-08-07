@@ -122,10 +122,12 @@
  * the two paths do not have to agree. */
 #define MPPT_MILLIVOLT_PER_AMP 136
 
-/* Array nameplate. Every current-domain threshold derives from Isc, and a
- * _Static_assert checks the open-circuit threshold stays below it.
- * Set for the 13.4 V / 120 mA bench panel - CHANGE FOR THE FLIGHT ARRAY. */
-#define MPPT_VOC_NOMINAL      1340    /* 13.40 V Voc at STC, 10 mV       */
+/* Array nameplate. Declare the CELL COUNT, not the voltage: mppt.h derives
+ * Voc, Vmpp, the Vmpp/Voc ratio, the diode voltage and both safety
+ * thresholds from it, and they cannot then disagree with each other.
+ * 19 SunPower cells = 13.49 V Voc, which is the 13.4 V bench panel.
+ * CHANGE BOTH FOR THE FLIGHT ARRAY. */
+#define MPPT_CELLS              19    /* series cells                    */
 #define MPPT_ARRAY_ISC          12    /*  0.12 A Isc at STC, 10 mA       */
 
 /* Safety thresholds - PLACEHOLDERS, see above. */

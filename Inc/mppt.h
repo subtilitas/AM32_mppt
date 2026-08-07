@@ -49,6 +49,8 @@
 
 #ifdef USE_MPPT
 
+#define MPPT_MAX2(a, b) ((a) > (b) ? (a) : (b))
+
 /* ===================================================================== */
 /*  1. PANEL / ARRAY CONFIGURATION       <-- SET THESE FIRST             */
 /* ===================================================================== */
@@ -74,29 +76,68 @@
  * override any of them without editing this file.
  */
 
-/* Nameplate open-circuit voltage of the array at STC. Used only as a
- * fallback until the firmware measures Voc for real at power-up. */
+/* ---------------------------------------------------------------------
+ * THE ARRAY IS DESCRIBED BY ITS CELL COUNT, NOT BY LOOSE VOLTAGES
+ *
+ * A typical RC solar wing is 10-16 SunPower back-contact cells in series.
+ * Those cells are well characterised and consistent, so one number - how
+ * many are in series - fixes Voc, Vmpp, the ratio between them, and the
+ * diode voltage the beta regulator needs. Deriving all four from it means
+ * they cannot drift apart, which is what happened when they were four
+ * independent constants.
+ *
+ * Per cell:  Voc 0.71 V,  Vmpp 0.62 V,  so Vmpp/Voc = 0.873.
+ *
+ * That ratio is much higher than the 0.78 textbook figure for ordinary
+ * crystalline silicon - back-contact cells have an unusually high fill
+ * factor. Using 0.78 on a SunPower array parks the setpoint about 12%
+ * below Vmpp.
+ *
+ * The implied per-cell diode voltage follows from the same two numbers:
+ * solving Vmpp = Voc - Vt*ln(1 + Vmpp/Vt) gives Vt = 28.9 mV, i.e. an
+ * ideality factor of 1.13. Consistent, and it is what MPPT_BETA_VT needs.
+ *
+ *      cells    Voc      Vmpp     Vt(array)
+ *        10    7.10 V   6.20 V     0.29 V
+ *        12    8.52 V   7.44 V     0.35 V
+ *        14    9.94 V   8.68 V     0.41 V
+ *        16   11.36 V   9.92 V     0.46 V
+ *
+ * SET MPPT_CELLS FOR YOUR WING. Everything else follows. Any individual
+ * constant can still be overridden in the board block if your cells are
+ * not SunPower.
+ * ------------------------------------------------------------------- */
+#ifndef MPPT_CELLS
+#define MPPT_CELLS                  14    /* series cells in the array */
+#endif
+#ifndef MPPT_CELL_VOC_MV
+#define MPPT_CELL_VOC_MV           710
+#endif
+#ifndef MPPT_CELL_VMPP_MV
+#define MPPT_CELL_VMPP_MV          620
+#endif
+/* Per-cell n*k*T/q implied by the Voc/Vmpp pair above. */
+#ifndef MPPT_CELL_VT_MV
+#define MPPT_CELL_VT_MV             29
+#endif
+
+/* Nameplate open-circuit voltage at STC, 10 mV units. Only a fallback
+ * until the firmware measures Voc for real at power-up. */
 #ifndef MPPT_VOC_NOMINAL
-#define MPPT_VOC_NOMINAL          1200    /* 12.00 V */
+#define MPPT_VOC_NOMINAL   ((MPPT_CELLS * MPPT_CELL_VOC_MV) / 10)
 #endif
 
-/* Vmpp/Voc ratio, Q8 (value/256). Crystalline silicon is 0.76-0.80.
- * 200/256 = 0.781.
- *
- * This is the SKELETON, not the answer: it sets the seed at startup and the
- * fallback when the current reading is too small for beta to work. Beta
- * trims around it. A good value still helps but is no longer critical.
- *
- * 0.781 is a textbook figure and real panels vary widely - for this panel
- * the true ratio is 0.845, so 0.781 alone would sit at 10.47 V against a
- * Vmpp of 11.32 V. That is the error beta removes. */
+/* Vmpp/Voc, Q8. Rounded, not truncated - the difference is a whole
+ * count of k and about 40 mV of setpoint. */
 #ifndef MPPT_K_FOCV_Q8
-#define MPPT_K_FOCV_Q8            200
+#define MPPT_K_FOCV_Q8 \
+    (((MPPT_CELL_VMPP_MV * 256) + (MPPT_CELL_VOC_MV / 2)) / MPPT_CELL_VOC_MV)
 #endif
 
-/* Bounds on the adapted ratio. No silicon panel has its MPP outside this,
- * so the tracker cannot walk the setpoint anywhere dangerous however badly
- * the rpm signal misbehaves. */
+/* Bounds on the ratio when the rpm tracker adapts it. Wide enough to hold
+ * both ordinary crystalline silicon (0.78) and back-contact cells (0.873),
+ * narrow enough that no amount of bad rpm data can walk the setpoint into
+ * the short-circuit region or out to open circuit. */
 #ifndef MPPT_K_MIN_Q8
 #define MPPT_K_MIN_Q8             160    /* 0.625 */
 #endif
@@ -133,14 +174,38 @@
  * Set them from your board's actual 3.3 V regulator dropout plus margin
  * before the first flight. See BENCH-UP in doc/MPPT.md.
  */
+/* THE ONE NUMBER THAT IS NOT ABOUT THE PANEL. The lowest bus voltage at
+ * which this board's 3.3 V rail still regulates - LDO dropout plus margin.
+ * It is a property of the ESC, not the array, so it does not scale with
+ * cell count and it is the hard floor everything else sits above.
+ *
+ * *** MEASURE IT. *** With no battery on the bus this is the last thing
+ * between a sagging panel and a dead MCU. 4.30 V suits a typical 3.3 V LDO;
+ * a board with a buck may go lower, one with a high-dropout part may not. */
+#ifndef MPPT_V_REG_MIN
+#define MPPT_V_REG_MIN             430    /*  4.30 V */
+#endif
+
+/* Duty forced to 0 - the rail is about to drop out. */
+#ifndef MPPT_V_ABSOLUTE_MIN
+#define MPPT_V_ABSOLUTE_MIN   MPPT_V_REG_MIN
+#endif
+
+/* Enter RECOVER. Scales with the array so a big wing reacts early instead
+ * of letting the bus fall most of the way to the regulator floor first,
+ * but is floored so a 10-cell wing does not put it on top of the
+ * absolute minimum.
+ *
+ * 0.62*Voc sits well below Vmpp (0.873*Voc) at every cell count, which
+ * matters: a collapse threshold above Vmpp is not conservative, it is a
+ * permanent RECOVER. The previous fixed 7.00 V did exactly that to any
+ * array of 12 cells or fewer. */
 #ifndef MPPT_V_COLLAPSE
-#define MPPT_V_COLLAPSE            700    /*  7.00 V - enter RECOVER      */
+#define MPPT_V_COLLAPSE \
+    MPPT_MAX2((MPPT_VOC_NOMINAL * 62) / 100, MPPT_V_ABSOLUTE_MIN + 60)
 #endif
 #ifndef MPPT_V_COLLAPSE_HYST
-#define MPPT_V_COLLAPSE_HYST        75    /*  0.75 V - exit hysteresis    */
-#endif
-#ifndef MPPT_V_ABSOLUTE_MIN
-#define MPPT_V_ABSOLUTE_MIN        550    /*  5.50 V - duty forced to 0   */
+#define MPPT_V_COLLAPSE_HYST  MPPT_MAX2(MPPT_VOC_NOMINAL / 20, 35)
 #endif
 
 /* How long to sit in RECOVER before giving up and fully unloading.
@@ -386,24 +451,35 @@ _Static_assert(MPPT_COAST_EXIT_DUTY > MPPT_COAST_DUTY_TH,
  * Sets c = 1/Vt. Calibrate from a measured I-V curve if you have one; the
  * default matches the 13.4 V bench panel. */
 #ifndef MPPT_BETA_VT
-#define MPPT_BETA_VT                75    /* 0.75 V */
+#define MPPT_BETA_VT   ((MPPT_CELLS * MPPT_CELL_VT_MV) / 10)
 #endif
 
-/* beta at the MPP, Q8. Nearly irradiance-invariant - that is the whole
- * point - but it IS panel-specific, and it also shifts with series
- * resistance. Computed for the 13.4 V / 120 mA bench panel:
+/* beta at the MPP, Q8 - DERIVED, not a magic constant.
  *
- *      Rs = 0 ohm   Vmpp 11.32 V   ->  -5049
- *      Rs = 5 ohm   Vmpp 10.83 V   ->  -4869
- *      Rs = 10 ohm  Vmpp 10.35 V   ->  -4693
+ *      beta_mpp = ln(Impp/Vmpp) - Vmpp/Vt
  *
- * TO CALIBRATE ON YOUR PANEL: find the best operating point by hand - the
- * throttle setting that gives peak rpm - and read mppt.beta off telemetry.
- * That number is this constant. It is a single reading and it does not
- * need repeating per irradiance, which is exactly what makes beta better
- * behaved than a fixed k. */
+ * and every term on the right is already known: Vmpp is k * the MEASURED
+ * Voc, Vt comes from the cell count, Impp is a fixed fraction of the
+ * declared Isc. So mppt.c computes it at init and again after each boot
+ * Voc capture, using the same integer ln the regulator uses.
+ *
+ * This has to be derived rather than defaulted. beta_mpp shifts with cell
+ * count (through both Vmpp and Vt) AND with array current (through
+ * ln(Impp)) - doubling the array area moves it by ln(2), which is 177 in
+ * Q8. There is no single number that is right for 10 cells and 16, or for
+ * a 0.5 A wing and a 3 A one. A fixed default would be wrong for almost
+ * every panel it shipped to.
+ *
+ * Deriving it also removes the hand-calibration step: set MPPT_CELLS and
+ * MPPT_ARRAY_ISC and the regulator has its target. Define
+ * MPPT_BETA_MPP_Q8 to pin it anyway if you have measured better. */
 #ifndef MPPT_BETA_MPP_Q8
-#define MPPT_BETA_MPP_Q8         (-5062)
+#define MPPT_BETA_MPP_DERIVED        1
+#endif
+
+/* Impp/Isc for a high-fill-factor back-contact cell. */
+#ifndef MPPT_IMPP_FRAC_Q8
+#define MPPT_IMPP_FRAC_Q8          243    /* 0.95 */
 #endif
 
 /* Regulator gain: 10 mV of vref per unit of beta error, Q8. Deliberately
@@ -675,7 +751,6 @@ _Static_assert(MPPT_COAST_EXIT_DUTY > MPPT_COAST_DUTY_TH,
 /* 5% of Isc, but never below what the ADC can actually resolve. On a small
  * array 5% of Isc rounds to zero - 5% of 120 mA is 6 mA and one ADC count
  * is 5.9 mA - so the floor is what binds there. */
-#define MPPT_MAX2(a, b) ((a) > (b) ? (a) : (b))
 #ifndef MPPT_VOC_I_TH
 #define MPPT_VOC_I_TH  MPPT_MAX2(MPPT_ARRAY_ISC / 20, \
                                  (((2 * MPPT_I_LSB_Q8) >> 8) + 1))
@@ -910,6 +985,7 @@ typedef struct {
 
     /* Beta method */
     int32_t  beta;              /* live beta, Q8 - telemetry / calibration */
+    int32_t  beta_mpp;          /* the target it is regulated to, Q8       */
     int32_t  beta_trim;         /* offset from the FOCV seed, 10 mV        */
     uint16_t beta_ticks;
     uint8_t  beta_valid;        /* 1 = current usable, regulator running   */

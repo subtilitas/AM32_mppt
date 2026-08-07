@@ -154,11 +154,63 @@ survives a cloud edge unchanged). That floor is a property of the sense
 chain, not the algorithm. See the crossover table in §7 item 7 — the rpm tracker still works down there
 and is the better fallback if you can tolerate its dither.
 
-**Calibration.** Two panel constants: `MPPT_BETA_VT` and
-`MPPT_BETA_MPP_Q8`, plus `MPPT_K_FOCV_Q8` for the seed and low-light
-fallback. To set the latter, find the best operating point by hand
-and read `mppt.beta` off telemetry. It is one reading and does not need
-repeating per irradiance.
+**Calibration — two numbers.** `MPPT_CELLS` and `MPPT_ARRAY_ISC`. Everything
+else derives: Voc, Vmpp, the ratio between them, the diode voltage, both
+safety thresholds, and β's own target. See §3.4.
+
+### 3.4 Describing the array
+
+A typical RC solar wing is 10–16 SunPower back-contact cells in series, and
+those cells are consistent enough that one number fixes the rest:
+
+    per cell:  Voc 0.71 V,  Vmpp 0.62 V   →   Vmpp/Voc = 0.873
+
+That ratio is far above the 0.78 textbook figure for ordinary crystalline
+silicon — back-contact cells have an unusually high fill factor — and using
+0.78 parks the setpoint about 12% below Vmpp. Solving
+`Vmpp = Voc − Vt·ln(1 + Vmpp/Vt)` against the same two numbers gives a
+per-cell diode voltage of 28.9 mV (ideality 1.13), which is exactly what β
+needs for `c = 1/Vt`.
+
+So the board block declares **`MPPT_CELLS`** and **`MPPT_ARRAY_ISC`**, and
+`mppt.h` derives:
+
+| Derived | From |
+|---|---|
+| `MPPT_VOC_NOMINAL` | cells × 0.71 V |
+| `MPPT_K_FOCV_Q8` | 0.62/0.71 = 224/256 |
+| `MPPT_BETA_VT` | cells × 28.9 mV |
+| `MPPT_V_COLLAPSE` | max(0.62 × Voc, `MPPT_V_REG_MIN` + 0.60 V) |
+| `MPPT_V_COLLAPSE_HYST` | max(Voc/20, 0.35 V) |
+| β's target `beta_mpp` | computed at runtime from measured Voc and Isc |
+
+**The safety thresholds have to scale.** They previously did not, and a fixed
+7.00 V collapse threshold sat *above* Vmpp for any array of 12 cells or
+fewer — which is not conservative, it is permanent `RECOVER`. Scaling from
+Voc fixes that, floored by `MPPT_V_REG_MIN`, the one number that is about the
+**board** rather than the panel: the lowest bus voltage at which its 3.3 V
+rail still regulates. Measure it.
+
+| cells | Voc | Vmpp | collapse | vref floor | Vt |
+|---|---|---|---|---|---|
+| 10 | 7.10 V | 6.21 V | 4.90 V | 5.25 V | 0.29 V |
+| 12 | 8.52 V | 7.45 V | 5.28 V | 5.70 V | 0.34 V |
+| 14 | 9.94 V | 8.69 V | 6.16 V | 6.65 V | 0.40 V |
+| 16 | 11.36 V | 9.94 V | 7.04 V | 7.60 V | 0.46 V |
+| 19 | 13.49 V | 11.80 V | 8.36 V | 9.03 V | 0.55 V |
+
+**β's target is derived, not calibrated.** `beta_mpp = ln(Impp/Vmpp) −
+Vmpp/Vt`, computed at init and again after the boot Voc capture using the
+module's own integer `ln`. It has to be derived: it shifts with cell count
+*and* with array current — doubling the array area moves it by ln(2) — so no
+fixed default could be right for both a 10-cell and a 16-cell wing, or for a
+0.5 A and a 3 A one. This also removes the hand-calibration step entirely.
+
+Measured against a SunPower plant model, 60 s, β with its derived target:
+
+| cells | 10 | 12 | 14 | 16 | 19 |
+|---|---|---|---|---|---|
+| tracking | 99.98% | 99.97% | 99.93% | 99.99% | 99.98% |
 
 ### 3.3 Voc measurement
 

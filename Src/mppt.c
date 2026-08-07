@@ -214,6 +214,25 @@ static int32_t mppt_ln_q8(uint32_t x)
     /* * ln(2), 0.693147 in Q16 = 45426 */
     return (log2_q8 * 45426) >> 16;
 }
+
+/* Compute the beta target from the array nameplate and the best Voc we
+ * have. Called at init and again whenever the boot capture lands a real
+ * Voc, so the target tracks the actual panel rather than a guess. */
+static void mppt_beta_target(void)
+{
+#ifdef MPPT_BETA_MPP_DERIVED
+    int32_t vmpp = (mppt.voc_est * mppt.k_focv_q8) >> 8;
+    int32_t impp = ((int32_t)MPPT_ARRAY_ISC * MPPT_IMPP_FRAC_Q8) >> 8;
+
+    if (vmpp > 0 && impp > 0) {
+        mppt.beta_mpp = mppt_ln_q8((uint32_t)impp) - mppt_ln_q8((uint32_t)vmpp)
+                        - ((vmpp << 8) / MPPT_BETA_VT);
+    }
+#else
+    mppt.beta_mpp = MPPT_BETA_MPP_Q8;
+#endif
+}
+
 #endif /* MPPT_TRACKER_BETA */
 
 /* --------------------------------------------------------------------- */
@@ -269,6 +288,7 @@ void mppt_init(void)
     mppt.rpm_have_last  = 0;
     mppt.rpm_dir        = +1;
     mppt.beta           = 0;
+    mppt.beta_mpp       = 0;
     mppt.beta_trim      = 0;
     mppt.beta_ticks     = 0;
     mppt.beta_valid     = 0;
@@ -310,6 +330,10 @@ void mppt_init(void)
         mppt.i = mppt.i_q8 >> 8;
     }
     mppt.quiet_v_last = mppt.v;
+
+#if MPPT_TRACKER == MPPT_TRACKER_BETA
+    mppt_beta_target();
+#endif
 }
 
 /* --------------------------------------------------------------------- */
@@ -445,7 +469,7 @@ static void mppt_beta_update(void)
     mppt.beta       = beta;
     mppt.beta_valid = 1;
 
-    err = beta - MPPT_BETA_MPP_Q8;      /* > 0  =>  below Vmpp  =>  raise */
+    err = beta - mppt.beta_mpp;         /* > 0  =>  below Vmpp  =>  raise */
     dv  = (err * MPPT_BETA_GAIN_Q8) >> 8;
 
     mppt.beta_trim = clamp32(mppt.beta_trim + dv,
@@ -594,6 +618,11 @@ void mppt_1khz_update(void)
                     mppt.boot_voc_done = 1;
                     /* Re-prime the current filter through the new zero. */
                     mppt.i             = mppt_read_amps();
+                    mppt.i_q8          = mppt.i << 8;
+#if MPPT_TRACKER == MPPT_TRACKER_BETA
+                    /* Real Voc now, so the beta target can stop guessing. */
+                    mppt_beta_target();
+#endif
                     mppt.i_q8          = mppt.i << 8;
                 }
                 mppt.quiet_ticks = 0;

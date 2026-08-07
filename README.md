@@ -54,6 +54,26 @@ Which tracker a board gets is decided by `test/mppt_targets.sh` from
 current-sense chain and get β (112 boards); the rest inherit AM32's fabricated
 `20` fallback and get the rpm tracker (136 boards).
 
+## Configuring your array
+
+Two numbers, in the board's block in `Inc/targets.h`:
+
+```c
+#define MPPT_CELLS       14   /* SunPower cells in series */
+#define MPPT_ARRAY_ISC   12   /* Isc at STC, 10 mA units  */
+```
+
+Everything else derives from those — Voc, Vmpp, the Vmpp/Voc ratio, the diode
+voltage, both safety thresholds and β's own target. SunPower back-contact
+cells are 0.71 V Voc and 0.62 V Vmpp each, giving a ratio of **0.873**, well
+above the 0.78 usual for ordinary crystalline silicon.
+
+Tracking with the derived target, 60 s against a SunPower plant model:
+
+| cells | 10 | 12 | 14 | 16 | 19 |
+|---|---|---|---|---|---|
+| tracking | 99.98% | 99.97% | 99.93% | 99.99% | 99.98% |
+
 Measured against a PV + bus-capacitor + BLDC + propeller plant model, 60 s:
 
 | irradiance | β | rpm |
@@ -69,11 +89,11 @@ Cost on EGAN_MPPT_L431: ~3.4 kB flash, 111 bytes RAM.
 
 Only `EGAN_MPPT_L431` has been characterised. For any other board:
 
-- `MPPT_BETA_MPP_Q8` and `MPPT_BETA_VT` are **panel**-specific. Find peak rpm by
-  hand and read `mppt.beta` off telemetry; that number is the constant.
-- `MPPT_V_COLLAPSE` and `MPPT_V_ABSOLUTE_MIN` are **placeholders**. With no
-  battery on the bus they are the only thing keeping the MCU alive — set them
-  from your board's 3.3 V regulator dropout plus margin.
+- Set `MPPT_CELLS` and `MPPT_ARRAY_ISC` for your wing.
+- `MPPT_V_REG_MIN` is the one number about the **board**, not the panel: the
+  lowest bus voltage at which its 3.3 V rail still regulates. With no battery
+  on the bus it is the last thing between a sagging panel and a dead MCU, and
+  the 4.30 V default is a guess. **Measure it.**
 - Keep the bus capacitor in roughly 100–1000 µF. 2200 µF is measured unstable.
 
 Follow the bench-up order in [doc/MPPT.md](doc/MPPT.md) §8.

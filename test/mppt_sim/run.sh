@@ -9,6 +9,7 @@
 #   EXTRA="-DSHADE_AT=5.0" ./run.sh 8    # force a bus collapse at t=5 s
 #   ./run.sh test                        # directed tests (test_directed.c)
 #   TRACKER=RPM ./run.sh 60              # exercise the no-current-sense fallback
+#   CELLS=10 ./run.sh 60                 # a 10-cell wing instead of the default 19
 #
 # ONE panel, with irradiance as the variable. There is deliberately no
 # "small array" versus "large array" case: a large array in low light draws
@@ -46,8 +47,15 @@ trap 'rm -rf "$OUT"' EXIT
 mkdir -p "$OUT/inc"
 
 G=${G:-1.0}
-PLANT="-DG_SCALE=$G"
-cp $ROOT/Inc/targets.h "$OUT/inc/targets.h"
+PLANT="-DG_SCALE=$G -DCELLS=${CELLS:-19}"
+# CELLS must reach BOTH the plant and the firmware, or the beta target is
+# derived for one panel and verified against another.
+if [ -n "${CELLS:-}" ]; then
+    sed -E "s/(#define MPPT_CELLS +)[0-9]+/\1$CELLS/" \
+        $ROOT/Inc/targets.h > "$OUT/inc/targets.h"
+else
+    cp $ROOT/Inc/targets.h "$OUT/inc/targets.h"
+fi
 cp $ROOT/Inc/mppt.h "$OUT/inc/"
 
 if [ "$1" = "test" ] || [ "$1" = "coast" ]; then

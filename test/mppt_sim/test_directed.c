@@ -32,6 +32,15 @@ extern int h_all_off;
 extern char play_tone_flag;
 extern int e_com_time;
 
+/* Operating point derived from the configured array, NOT hard-coded. These
+ * tests used to feed a fixed 10.5 V; when the Vmpp/Voc ratio moved from
+ * 0.781 to 0.875 for SunPower cells that stopped being anywhere near the
+ * setpoint, the PI drove duty to the rail and the authority gate correctly
+ * refused to compute beta - a real test failure caused entirely by a stale
+ * constant in the test. */
+#define VOC_V   (MPPT_VOC_NOMINAL / 100.0)
+#define VMPP_V  ((((MPPT_VOC_NOMINAL * MPPT_K_FOCV_Q8) >> 8)) / 100.0)
+
 static int fails = 0;
 
 static void ok(const char *what, int cond)
@@ -69,6 +78,19 @@ static uint16_t step(double bus_v, double bus_i, uint16_t am32_duty)
     return d;
 }
 
+
+/* Get the inner PI off the rail and into range, so the authority gate lets
+ * the outer tracker run. Needed because this rig has no plant: v does not
+ * respond to duty, so whichever way the error points, duty eventually rails
+ * and every outer-loop test after that silently does nothing. Feeding a
+ * voltage ABOVE the setpoint drives duty up off zero. */
+static void prime_authority(void)
+{
+    int k;
+    mppt_init();
+    for (k = 0; k < 80; k++) step(VMPP_V * 1.05, 0.11, 1200);
+}
+
 int main(void)
 {
     int i, all_off_ticks;
@@ -82,7 +104,7 @@ int main(void)
     printf("coast path\n");
 
     /* 1. healthy bus, normal running */
-    for (i = 0; i < 400; i++) step(10.5, 0.11, 1200);
+    for (i = 0; i < 400; i++) step(VMPP_V, 0.11, 1200);
     ok("healthy running does not coast", !mppt.coasting);
     ok("healthy running drives the FETs", h_all_off == 0);
 
@@ -92,7 +114,7 @@ int main(void)
     armed = 1; running = 1; input = 2047;
     all_off_ticks = 0;
     for (i = 0; i < 200; i++) {
-        step(13.0, 0.01, (uint16_t)(i * 5));  /* AM32 ramping up from 0 */
+        step(VOC_V * 0.97, 0.01, (uint16_t)(i * 5));  /* AM32 ramping up from 0 */
         if (h_all_off) all_off_ticks++;
     }
     ok("spin-up never coasts despite duty passing through 0",
@@ -102,10 +124,10 @@ int main(void)
     mppt_init();
     zero_crosses = 5000;
     armed = 1; running = 1; input = 2047;
-    for (i = 0; i < 400; i++) step(10.5, 0.11, 1200);
+    for (i = 0; i < 400; i++) step(VMPP_V, 0.11, 1200);
     ok("settled before the collapse", mppt.state == MPPT_STATE_TRACK);
 
-    for (i = 0; i < 200; i++) step(6.5, 0.02, 1200);   /* below V_COLLAPSE */
+    for (i = 0; i < 200; i++) step(MPPT_V_COLLAPSE / 100.0 - 0.4, 0.02, 1200);   /* below V_COLLAPSE */
     ok("collapse entered RECOVER", mppt.state == MPPT_STATE_RECOVER);
     ok("collapse counted", mppt.collapse_events > 0);
     ok("RECOVER coasts once duty decays", mppt.coasting);
@@ -113,14 +135,14 @@ int main(void)
 
     /* 4. allOff() re-asserted every tick, not just on entry */
     all_off_ticks = 0;
-    for (i = 0; i < 50; i++) { step(6.5, 0.02, 1200); if (h_all_off) all_off_ticks++; }
+    for (i = 0; i < 50; i++) { step(MPPT_V_COLLAPSE / 100.0 - 0.4, 0.02, 1200); if (h_all_off) all_off_ticks++; }
     ok("allOff() re-asserted on every coasting tick", all_off_ticks == 50);
 
     /* and the duty handed to the PWM is zero throughout */
-    ok("duty forced to 0 while coasting", step(6.5, 0.02, 1200) == 0);
+    ok("duty forced to 0 while coasting", step(MPPT_V_COLLAPSE / 100.0 - 0.4, 0.02, 1200) == 0);
 
     /* 5. bus recovers -> coast released, FETs driven again */
-    for (i = 0; i < 600; i++) step(12.5, 0.05, 1200);
+    for (i = 0; i < 600; i++) step(VOC_V * 0.93, 0.05, 1200);
     ok("coast released after recovery", !mppt.coasting);
     ok("FETs driven again after recovery", h_all_off == 0);
     ok("left RECOVER after recovery", mppt.state != MPPT_STATE_RECOVER);
@@ -147,7 +169,7 @@ int main(void)
 
         armed = 0; running = 0; input = 0; zero_crosses = 0;
         play_tone_flag = 0;
-        ADC_raw_volts = adc_v(13.40); ADC_raw_current = adc_i(0.0);
+        ADC_raw_volts = adc_v(VOC_V); ADC_raw_current = adc_i(0.0);
         mppt_init();
         ok("nothing captured at init", !mppt.boot_voc_done && mppt.voc_boot == 0);
         ok("falls back to the nameplate until then",
@@ -155,7 +177,7 @@ int main(void)
 
         /* a tune is playing - must not sample, however quiet the bus looks */
         play_tone_flag = 1;
-        for (i = 0; i < settle * 3; i++) step(13.40, 0.0, 0);
+        for (i = 0; i < settle * 3; i++) step(VOC_V, 0.0, 0);
         ok("does not sample while a tone is pending", !mppt.boot_voc_done);
 
         /* Tune done, but Cbus is still refilling. Deliberately a SLOW ramp -
@@ -163,28 +185,28 @@ int main(void)
          * reject and a slow one is what defeats tick-to-tick differencing. */
         play_tone_flag = 0;
         for (i = 0; i < settle * 3 / 2; i++)
-            step(9.0 + i * (4.0 / (settle * 3.0 / 2.0)), 0.0, 0);
+            step(VOC_V * 0.67 + i * ((VOC_V * 0.33) / (settle * 3.0 / 2.0)), 0.0, 0);
         ok("does not sample while the bus is still rising", !mppt.boot_voc_done);
 
         /* quiet and settled, but not yet for long enough */
-        for (i = 0; i < settle - 4; i++) step(13.40, 0.0, 0);
+        for (i = 0; i < settle - 4; i++) step(VOC_V, 0.0, 0);
         ok("does not sample before the settle time has elapsed",
            !mppt.boot_voc_done);
 
         /* ...and now it should latch */
-        for (i = 0; i < 8; i++) step(13.40, 0.0, 0);
+        for (i = 0; i < 8; i++) step(VOC_V, 0.0, 0);
         ok("captures once quiet and settled", mppt.boot_voc_done);
         ok("captured the right voltage",
-           mppt.voc_boot > 1320 && mppt.voc_boot < 1360);
+           mppt.voc_boot > MPPT_VOC_NOMINAL - 30 && mppt.voc_boot < MPPT_VOC_NOMINAL + 30);
         ok("setpoint follows the capture",
-           mppt.vref > ((1320 * MPPT_K_FOCV_Q8) >> 8) &&
-           mppt.vref < ((1370 * MPPT_K_FOCV_Q8) >> 8));
+           mppt.vref > (((MPPT_VOC_NOMINAL - 30) * MPPT_K_FOCV_Q8) >> 8) &&
+           mppt.vref < (((MPPT_VOC_NOMINAL + 30) * MPPT_K_FOCV_Q8) >> 8));
 
         /* an arming tune afterwards must not disturb the captured value */
         {
             int32_t held = mppt.voc_boot;
             play_tone_flag = 2;
-            for (i = 0; i < settle * 2; i++) step(9.5, 0.0, 0);
+            for (i = 0; i < settle * 2; i++) step(VOC_V * 0.70, 0.0, 0);
             play_tone_flag = 0;
             ok("a later arming tune does not overwrite it",
                mppt.voc_boot == held && mppt.boot_voc_done);
@@ -207,43 +229,54 @@ int main(void)
          * converge - left running it winds the trim until duty rails and the
          * authority gate (correctly) marks beta invalid. Check it while the
          * PI still has authority. */
-        for (i = 0; i < 40; i++) step(10.5, 0.11, 1200);
+        /* Slightly ABOVE Vmpp on purpose: at exactly the setpoint the error
+         * is zero, the PI has no reason to leave duty 0, and the authority
+         * gate then (correctly) refuses to compute beta. */
+        for (i = 0; i < 40; i++) step(VMPP_V * 1.03, 0.11, 1200);
         ok("computes a beta when current is usable",
            mppt.beta_valid && mppt.beta < 0);
 
         /* ...and that the authority gate does exactly that once duty rails */
-        for (i = 0; i < 2000; i++) step(10.5, 0.11, 1200);
+        for (i = 0; i < 2000; i++) step(VMPP_V * 1.03, 0.11, 1200);
         ok("marks beta invalid once the PI loses authority", !mppt.beta_valid);
 
         /* Sign convention. beta below target means the panel is being held
          * ABOVE Vmpp, so the trim must come DOWN. Getting this backwards
          * walks the setpoint into the short-circuit region. */
+        /* One update window each, from a primed state, and only a few percent
+         * either side of Vmpp. Longer runs or bigger offsets rail the duty and
+         * stop the tracker, which would make these pass vacuously. */
+        prime_authority();
         t1 = mppt.beta_trim;
-        for (i = 0; i < 2000; i++) step(12.6, 0.05, 1200);  /* high V, low I */
+        for (i = 0; i < MPPT_BETA_PERIOD_TICKS + 2; i++)
+            step(VMPP_V * 1.05, 0.05, 1200);         /* above Vmpp, low I  */
         t2 = mppt.beta_trim;
         ok("held above Vmpp, the trim decreases", t2 < t1);
 
+        prime_authority();
         t1 = mppt.beta_trim;
-        for (i = 0; i < 2000; i++) step(8.5, 0.118, 1200);  /* low V, high I */
+        for (i = 0; i < MPPT_BETA_PERIOD_TICKS + 2; i++)
+            step(VMPP_V * 0.95, 0.118, 1200);        /* below Vmpp, high I */
         t2 = mppt.beta_trim;
         ok("held below Vmpp, the trim increases", t2 > t1);
 
         /* Low light: current falls under the resolvable floor. The trim is
          * the learned part and must survive, or every cloud would throw the
          * calibration away. */
+        prime_authority();
         t1 = mppt.beta_trim;
-        for (i = 0; i < 4000; i++) step(11.0, 0.000, 1200);
+        for (i = 0; i < 4000; i++) step(VMPP_V, 0.000, 1200);
         ok("goes invalid when current is unusable", !mppt.beta_valid);
         ok("holds the learned trim through low light", mppt.beta_trim == t1);
 
         /* and it can never pull the setpoint arbitrarily far */
-        for (i = 0; i < 60000; i++) step(8.0, 0.119, 1200);
+        for (i = 0; i < 60000; i++) step(VMPP_V * 0.72, 0.119, 1200);
         ok("trim stays inside its bound",
            mppt.beta_trim <= MPPT_BETA_TRIM_MAX &&
            mppt.beta_trim >= -MPPT_BETA_TRIM_MAX);
 
         /* zero current must not reach ln(0) */
-        for (i = 0; i < 200; i++) step(11.0, 0.0, 1200);
+        for (i = 0; i < 200; i++) step(VMPP_V, 0.0, 1200);
         ok("no ln(0) at zero current", !mppt.beta_valid);
     }
 
@@ -265,7 +298,7 @@ int main(void)
          * would move k on a number that is not a speed at all. */
         k0 = mppt.k_focv_q8; mppt.rpm_steps = 0;
         e_com_time = 65408;
-        for (i = 0; i < 4000; i++) step(10.5, 0.11, 1200);
+        for (i = 0; i < 4000; i++) step(VMPP_V, 0.11, 1200);
         ok("rejects the 65408 pre-spin-up sentinel",
            mppt.rpm_steps == 0 && mppt.k_focv_q8 == k0);
 
@@ -274,17 +307,18 @@ int main(void)
         e_com_time = 200; mppt.rpm_steps = 0;
         for (i = 0; i < 4000; i++) {
             input = (uint16_t)(1500 + (i % 400));
-            step(10.5, 0.11, 1200);
+            step(VMPP_V, 0.11, 1200);
         }
         ok("does not adapt while the throttle is moving", mppt.rpm_steps == 0);
 
-        input = 2047; mppt.rpm_steps = 0;
-        for (i = 0; i < 4000; i++) step(10.5, 0.11, 1200);
+        prime_authority();
+        input = 2047; e_com_time = 200; mppt.rpm_steps = 0;
+        for (i = 0; i < 4000; i++) step(VMPP_V * 1.05, 0.11, 1200);
         ok("adapts again once the throttle settles", mppt.rpm_steps > 0);
 
         /* However badly the rpm signal misbehaves, k cannot leave the band
          * that every silicon panel's MPP lives in. */
-        for (i = 0; i < 40000; i++) { e_com_time = 200 + (i % 3); step(10.5, 0.11, 1200); }
+        for (i = 0; i < 40000; i++) { e_com_time = 200 + (i % 3); step(VMPP_V * 1.05, 0.11, 1200); }
         ok("k stays inside the sanity bounds",
            mppt.k_focv_q8 >= MPPT_K_MIN_Q8 && mppt.k_focv_q8 <= MPPT_K_MAX_Q8);
     }
@@ -297,15 +331,15 @@ int main(void)
     {
         const int settle = MPPT_BOOT_VOC_SETTLE_TICKS;
         armed = 0; running = 0; input = 0; zero_crosses = 0; play_tone_flag = 0;
-        ADC_raw_volts = adc_v(13.40); ADC_raw_current = adc_i(0.0);
+        ADC_raw_volts = adc_v(VOC_V); ADC_raw_current = adc_i(0.0);
         mppt_init();
         ok("uses CURRENT_OFFSET until calibrated", !mppt.i_zero_done);
-        for (i = 0; i < settle + 8; i++) step(13.40, 0.0, 0);
+        for (i = 0; i < settle + 8; i++) step(VOC_V, 0.0, 0);
         ok("captures the zero in the quiet window", mppt.i_zero_done);
         ok("captured zero matches the sensor midpoint",
            mppt.i_zero_raw > adc_i(0.0) - 3 && mppt.i_zero_raw < adc_i(0.0) + 3);
         /* and a real current still reads correctly through the new zero */
-        for (i = 0; i < 60; i++) step(11.0, 0.100, 400);
+        for (i = 0; i < 60; i++) step(VMPP_V, 0.100, 400);
         ok("current reads sanely after calibration",
            mppt.i >= 7 && mppt.i <= 13);
     }

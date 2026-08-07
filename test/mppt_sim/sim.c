@@ -13,19 +13,21 @@ extern int e_com_time;
 extern char play_tone_flag;
 
 /* ~12 V Voc array, sized to what EGAN_MPPT_L431 can actually measure. */
+/* SunPower back-contact cells, the usual RC choice: 0.71 V Voc and 0.62 V
+ * Vmpp per cell, which implies a 28.9 mV per-cell diode voltage. The plant
+ * must model the SAME cell the firmware assumes, or the beta target is
+ * derived for one panel and verified against another. */
+#ifndef CELLS
+#define CELLS   19
+#endif
 #ifndef VOC_STC
-#define VOC_STC 13.4
+#define VOC_STC (CELLS * 0.710)
 #endif
 #ifndef ISC_STC
 #define ISC_STC  0.120
 #endif
 #ifndef VTH
-#define VTH      0.75
-#endif
-/* TRUE hardware sense gain - NOT MILLIVOLT_PER_AMP, which this board
- * deliberately mis-sets so DShot telemetry reads non-zero. */
-#ifndef HW_MVA
-#define HW_MVA MILLIVOLT_PER_AMP
+#define VTH     (CELLS * 0.0289)
 #endif
 #ifndef CBUS
 #define CBUS   470e-6
