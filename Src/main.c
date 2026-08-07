@@ -340,7 +340,6 @@ uint8_t servo_dead_band = 100;
 
 //========================= Battery Cuttoff Settings ========================
 char LOW_VOLTAGE_CUTOFF = 0; // Turn Low Voltage CUTOFF on or off
-char lvc_mode = 0; // runtime copy of eepromBuffer.low_voltage_cut_off, see loadEEpromSettings()
 uint16_t low_cell_volt_cutoff = 330; // 3.3volts per cell
 
 //=========================== END EEPROM Defaults ===========================
@@ -360,110 +359,6 @@ int32_t input_override = 0;
 int16_t use_current_limit_adjust = 2000;
 char use_current_limit = 0;
 int32_t stall_protection_adjust = 0;
-
-#ifdef ENABLE_MPPT
-//============================ MPP tracker state ============================
-// The MPP target voltage reuses the low voltage cell cutoff eeprom byte, but
-// reads it raw (0..255) rather than through its usual +250 per-cell decode:
-//
-//     target = (MPPT_VOLTAGE_OFFSET * 100) + eepromBuffer.low_cell_volt_cutoff
-//
-// The voltage scale counts 10mV per bit, so the raw byte needs no scaling: one
-// count == 10mV. MPPT_VOLTAGE_OFFSET is in whole volts and sets the bottom of
-// the range.
-//
-// The byte holds 0..255, but the configuration tool clamps that field to
-// 2.50..3.50 V per cell, so only raw 0..100 is actually reachable. The usable
-// span is therefore 1.00 V starting at the offset, NOT 2.55 V. Choose
-// MPPT_VOLTAGE_OFFSET so the panel's MPP falls inside that window: a 6.4 V panel
-// wants offset 6, giving 6.00..7.00 V, with 6.40 V selected by entering 290.
-//
-// Nothing here depends on cell_count, so the target is fixed at boot and is
-// unaffected by how the source happens to be loaded at arming time.
-#ifndef MPPT_VOLTAGE_OFFSET
-#define MPPT_VOLTAGE_OFFSET 5 // volts
-#endif
-// Reference integrator gain. mppt_duty_adjust holds the duty limit scaled by
-// 10000, so one count of voltage error (10mV) moves the limit by mppt_ki/10000
-// duty counts per millisecond. At 400 that is 0.04 counts/ms/10mV.
-//
-// This is only the power-on value: loadEEpromSettings() overwrites mppt_ki from
-// eepromBuffer.current_P before the motor can run, so the gain is set from the
-// config tool, not here. 400 is what current_P = 100 (the stock default)
-// reproduces, and is the value the loop was originally characterised at.
-#ifndef MPPT_KI
-#define MPPT_KI 400
-#endif
-// Hard cutoff. Reaching it means the rail has collapsed far below anything the
-// tracker would ask for, so the bridge is killed rather than waiting for the
-// integrator to wind down.
-//
-// Deliberately read from the *filtered* battery_voltage, not the raw conversion.
-// The (7*old + new)>>3 filter is self debouncing in exactly the way this needs:
-// detection latency scales with severity, so a total collapse is caught in ~2ms
-// while a marginal dip takes ~10ms and a brief inrush sag is ignored entirely.
-// A fixed sample counter would be strictly worse, delaying the severe case as
-// much as the harmless one. The filter's ~0.07V truncation bias makes the cutoff
-// fire marginally early, which is the safe direction for a protection threshold.
-//
-// The cutoff must sit *below* the bottom of the target range, not on it. If the
-// target were allowed to fall between the cutoff and its recovery threshold, the
-// tracker would be aiming at a voltage that can never clear its own cutoff, and
-// the esc would latch off for good. MPPT_CUTOFF_MARGIN buys that headroom, and
-// is deliberately generous: this is a last resort, not a regulator.
-#ifndef MPPT_CUTOFF_MARGIN
-#define MPPT_CUTOFF_MARGIN 250 // 2.50 V below the lowest selectable target
-#endif
-#define MPPT_CUTOFF_CV ((MPPT_VOLTAGE_OFFSET * 100) - MPPT_CUTOFF_MARGIN)
-// Re-enable margin, in 0.01V. Without it the load would chatter on and off as
-// the rail recovers the instant the bridge is cut.
-#ifndef MPPT_CUTOFF_HYST
-#define MPPT_CUTOFF_HYST 50 // 0.50 V
-#endif
-// zero_crosses value below which the motor is still considered to be starting.
-// Matches the window used by the existing min_startup_duty clamp. Inside it the
-// tracker is frozen: it neither integrates nor clamps, so it cannot wind the
-// limit down in response to the startup sag and starve the very ramp that would
-// end that sag. Frozen, not released -- see the 1khz block for why snapping the
-// limit back to full here turns a brief desync into a stuttering oscillation.
-#define MPPT_STARTUP_ZC 30
-// The lowest selectable target is MPPT_VOLTAGE_OFFSET * 100 (eeprom byte 0). It
-// has to clear the recovery threshold, or that setting latches the esc off.
-_Static_assert((MPPT_VOLTAGE_OFFSET * 100) > (MPPT_CUTOFF_CV + MPPT_CUTOFF_HYST),
-    "MPPT_CUTOFF_MARGIN must exceed MPPT_CUTOFF_HYST, or the lowest MPP target "
-    "sits below the cutoff recovery threshold and the tracker can never restart");
-_Static_assert(MPPT_CUTOFF_CV > 0, "MPPT_VOLTAGE_OFFSET too low for MPPT_CUTOFF_MARGIN");
-uint16_t mppt_target_voltage = 0; // 0.01V units, same scale as battery_voltage
-int32_t mppt_duty_adjust = (int32_t)2000 * 10000; // duty limit * 10000
-int16_t mppt_duty_limit = 2000; // duty limit actually applied, 0..2000
-char mppt_limiting = 0; // diagnostic only, never read: 1 while holding duty back
-char mppt_cutoff = 0; // 1 while the hard undervoltage cutoff is holding output off
-uint32_t mppt_ki = MPPT_KI; // integrator gain, set from eepromBuffer.current_P
-char mppt_enabled = 0; // 0 when current_P is 0, ie tracker switched off at runtime
-uint16_t mppt_voltage = 0; // median filtered input voltage, 0.01V units
-uint16_t mppt_v_hist[2]; // previous two raw samples for the median
-char mppt_v_primed = 0; // history seeded with a real sample yet?
-
-// Median of three, used for the *tracking* input only. A linear filter merely
-// attenuates an impulse, smearing it over the following samples, whereas the
-// median discards it outright. It is also an order statistic, so unlike the
-// (7*old + new)>>3 filter behind battery_voltage it introduces no truncation
-// bias -- which matters here, because a systematic offset in the tracking input
-// becomes a systematic offset in the voltage the panel is held at.
-// Rejects corruption only while it is isolated, at most one bad sample in any
-// window of three.
-//
-// The hard cutoff deliberately uses battery_voltage instead. That is not an
-// inconsistency: a threshold wants severity-proportional debouncing and does not
-// care about a 0.07V bias, whereas a regulator wants an unbiased estimate and
-// can supply its own filtering through the integrator.
-static uint16_t mppt_median3(uint16_t a, uint16_t b, uint16_t c)
-{
-    uint16_t mx = a > b ? a : b;
-    uint16_t mn = a < b ? a : b;
-    return c > mx ? mx : (c < mn ? mn : c);
-}
-#endif
 uint32_t MCU_Id = 0;
 uint32_t REV_Id = 0;
 
@@ -721,35 +616,6 @@ void loadEEpromSettings()
       eepromBuffer.reserved_eeprom_3[2] = 0;
       eepromBuffer.reserved_eeprom_3[3] = 0;
     }
-    // Runtime copy of the low voltage cutoff mode. Deliberately never written
-    // back to eepromBuffer, so nothing here can be persisted to flash by the
-    // saveEEpromSettings() that runs on a firmware version change.
-    lvc_mode = eepromBuffer.low_voltage_cut_off;
-#ifdef ENABLE_MPPT
-    // MPP target is a fixed function of the eeprom byte, so resolve it once here.
-    mppt_target_voltage = (uint16_t)((MPPT_VOLTAGE_OFFSET * 100) + eepromBuffer.low_cell_volt_cutoff);
-    // Mode 1 derives its threshold from cell_count and the same eeprom byte via
-    // a completely different decode, landing far above the MPP target, so it
-    // would disarm the ESC seconds into every track. Force it off for this run.
-    // Mode 2 (absolute cutoff) is untouched and remains usable as a backstop.
-    if (lvc_mode == 1) {
-        lvc_mode = 0;
-    }
-    // Integrator gain from the current PID's P term, 0..255 scaled by 4 to give
-    // 0..1020. currentPid.Kp is left as the current limiter set it, but that
-    // limiter is disabled just below so it has no effect.
-    //
-    // current_P == 0 switches the tracker off entirely. That is the runtime off
-    // switch: it makes the esc behave as a stock build without reflashing, so
-    // "is this the tracker or the motor?" can be answered from the config tool.
-    mppt_ki = (uint32_t)eepromBuffer.current_P * 4;
-    mppt_enabled = (mppt_ki != 0);
-    mppt_duty_adjust = (int32_t)2000 * 10000;
-    mppt_duty_limit = 2000;
-    mppt_limiting = 0;
-    mppt_cutoff = 0;
-    mppt_v_primed = 0;
-#endif
     // eepromBuffer.advance_level can either be set to 0-3 with config tools less than 1.90 or 10-42 with 1.90 or above 
     if (eepromBuffer.advance_level > 42 || (eepromBuffer.advance_level < 10 && eepromBuffer.advance_level > 3)){
         temp_advance = 16;
@@ -858,13 +724,7 @@ void loadEEpromSettings()
         if (eepromBuffer.limits.current > 0 && eepromBuffer.limits.current < 100) {
             use_current_limit = 1;
         }
-#ifdef ENABLE_MPPT
-        // current_P has been repurposed as the MPP tracker gain, so currentPid
-        // no longer holds a meaningful P term. Disable the current limiter
-        // rather than let it clamp duty using a gain that means something else.
-        use_current_limit = 0;
-#endif
-
+        
         currentPid.Kp = eepromBuffer.current_P*2;
         currentPid.Ki = eepromBuffer.current_I;
         currentPid.Kd = eepromBuffer.current_D*2;
@@ -1463,20 +1323,6 @@ if (!stepper_sine && armed) {
                 }
             }
 
-#ifdef ENABLE_MPPT
-            // MPP tracker: downward-only clamp. Throttle still sets the
-            // ceiling, the tracker can only take power away.
-            if (mppt_cutoff) {
-                duty_cycle_setpoint = 0; // hard undervoltage cutoff
-            } else if (mppt_enabled && zero_crosses >= MPPT_STARTUP_ZC
-                && duty_cycle_setpoint > mppt_duty_limit) {
-                // Startup is exempt. The min_startup_duty floor set just above
-                // must survive, or the tracker starves the ramp that would end
-                // the voltage sag it is reacting to.
-                duty_cycle_setpoint = mppt_duty_limit;
-            }
-#endif
-
             if (stall_protection_adjust > 0 && input > 47) {
 
                 duty_cycle_setpoint = duty_cycle_setpoint + (uint16_t)(stall_protection_adjust/10000);
@@ -1509,7 +1355,7 @@ void tenKhzRoutine()
 #ifdef USE_RGB_LED
                             setIndividualRGBLed(0,1,0);
 #endif
-                            if ((cell_count == 0) && lvc_mode == 1) {
+                            if ((cell_count == 0) && eepromBuffer.low_voltage_cut_off == 1) {
                                 cell_count = battery_voltage / 370;
                                 for (int i = 0; i < cell_count; i++) {
                                     playInputTune();
@@ -1586,54 +1432,6 @@ void tenKhzRoutine()
                     use_current_limit_adjust = 2000;
                 }
             }
-#ifdef ENABLE_MPPT
-            //==================== MPP tracker (1khz) =====================
-            // Holds the input (battery / panel) voltage at the MPP voltage by
-            // pulling the duty cycle back. Does nothing while the source can
-            // hold the target: at or above mppt_target_voltage the limit walks
-            // back up to 2000 and the throttle is unaffected.
-            //
-            // mppt_target_voltage is resolved once in loadEEpromSettings().
-            if (!mppt_enabled || !running || !armed) {
-                // Genuinely stopped, or tracking switched off. Release fully so a
-                // stale low limit can never choke the next spin-up.
-                mppt_duty_adjust = (int32_t)2000 * 10000;
-                mppt_duty_limit = 2000;
-                mppt_limiting = 0;
-            } else if (zero_crosses < MPPT_STARTUP_ZC) {
-                // Running, but still inside the startup window: hold the loop
-                // frozen. Deliberately NOT released back to 2000. A brief desync
-                // drops zero_crosses back through this window, and snapping the
-                // limit to full there hands the motor a surge the source cannot
-                // supply, which collapses the rail, which desyncs it again. That
-                // is a relaxation oscillator, and it shows up as stuttering.
-            } else {
-                // Pure integral. mppt_duty_adjust IS the duty limit (x10000), so
-                // a standing error keeps walking it until the voltage reaches
-                // the target, giving zero steady state error. Sagging below
-                // target gives a negative error which lowers the limit;
-                // recovering above target gives a positive error which releases
-                // it again, up to the 2000 clamp.
-                mppt_duty_adjust += (int32_t)mppt_ki
-                    * ((int32_t)mppt_voltage - (int32_t)mppt_target_voltage);
-
-                if (mppt_duty_adjust > (int32_t)2000 * 10000) { // anti-windup, fully released
-                    mppt_duty_adjust = (int32_t)2000 * 10000;
-                }
-                // Floor at min_startup_duty, not minimum_duty_cycle. The latter is
-                // barely above DEAD_TIME, low enough that winding down to it
-                // stalls the motor outright, and a stalled motor draws more
-                // current, not less, so the loop would keep winding into the
-                // stall rather than out of it.
-                if (mppt_duty_adjust < (int32_t)min_startup_duty * 10000) {
-                    mppt_duty_adjust = (int32_t)min_startup_duty * 10000;
-                }
-                mppt_duty_limit = (int16_t)(mppt_duty_adjust / 10000);
-                // Status only, handy to watch in a debugger or telemetry while
-                // tuning: set whenever the tracker is holding duty below full.
-                mppt_limiting = (mppt_duty_limit < 2000);
-            }
-#endif
             if (eepromBuffer.stall_protection && running) { // this boosts throttle as the rpm gets lower, for crawlers
                                                // and rc cars only, do not use for multirotors.
                 stall_protection_adjust += (doPidCalculations(&stallPid, commutation_interval,
@@ -2333,59 +2131,8 @@ if(zero_crosses < 5){
 #endif
             if (actual_current < 0) {
                 actual_current = 0;
-            }
-#ifdef ENABLE_MPPT
-            {
-                // Both the tracker and the hard cutoff run off this one signal:
-                // the unfiltered conversion passed through a median of three.
-                // battery_voltage is deliberately not used. Its (7*old + new)/8
-                // filter truncates every iteration, which leaves the reading up
-                // to 7 counts (0.07V) below the true voltage, and the tracker
-                // would faithfully hold the panel that far off target.
-#ifdef NXP
-                uint16_t mppt_v_raw = (uint16_t)((ADC_raw_volts * 3300 / 65535 * VOLTAGE_DIVIDER) / 100);
-#else
-                uint16_t mppt_v_raw = (uint16_t)((ADC_raw_volts * 3300 / 4095 * VOLTAGE_DIVIDER) / 100);
-#endif
-                if (!mppt_v_primed) {
-                    // Seed both slots from the first real conversion. Left at
-                    // zero the first median would be zero, which would trip the
-                    // cutoff below before a single valid sample had been seen.
-                    mppt_v_hist[0] = mppt_v_raw;
-                    mppt_v_hist[1] = mppt_v_raw;
-                    mppt_v_primed = 1;
-                }
-                mppt_voltage = mppt_median3(mppt_v_raw, mppt_v_hist[0], mppt_v_hist[1]);
-                mppt_v_hist[1] = mppt_v_hist[0];
-                mppt_v_hist[0] = mppt_v_raw;
-
-                // Hard cutoff, from the filtered value. See MPPT_CUTOFF_CV above
-                // for why filtered rather than the median: the filter debounces
-                // in proportion to severity, which is what this wants.
-                if (!running) {
-                    // A stopped motor is not loading the source, so nothing here
-                    // can still be collapsing it. Clearing on !running matters
-                    // because sine startup drives the FETs through
-                    // setPWMCompare() and never reaches this code: both this
-                    // block and PROCESS_ADC_FLAG sit inside if (!stepper_sine),
-                    // so a latched cutoff would survive the whole sine ramp and
-                    // then zero the duty the instant normal commutation took
-                    // over, with no path to recover.
-                    mppt_cutoff = 0;
-                } else if (battery_voltage <= MPPT_CUTOFF_CV) {
-                    mppt_cutoff = 1;
-                    allOff();
-                    maskPhaseInterrupts();
-                    running = 0;
-                } else if (battery_voltage > (MPPT_CUTOFF_CV + MPPT_CUTOFF_HYST)) {
-                    // Hysteresis stops the output chattering as the rail springs
-                    // back the instant the load is removed. armed is left alone,
-                    // so this recovers by itself through the normal startup ramp.
-                    mppt_cutoff = 0;
-                }
-            }
-#endif
-            if (lvc_mode == 1) {
+            }             
+            if (eepromBuffer.low_voltage_cut_off == 1) {  
                 if (battery_voltage < (cell_count * low_cell_volt_cutoff)) {
                   low_voltage_count++;
                 } else {
@@ -2394,7 +2141,7 @@ if(zero_crosses < 5){
                   }
                 }
             }
-            if (lvc_mode == 2 ){   // absolute cut off
+            if (eepromBuffer.low_voltage_cut_off == 2 ){   // absolute cut off
               if (battery_voltage <  eepromBuffer.absolute_voltage_cutoff) {
                 low_voltage_count++;    
                 } else {
