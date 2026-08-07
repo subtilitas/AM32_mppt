@@ -109,7 +109,9 @@
  * MPPT_V_ABSOLUTE_MIN from this board's actual 3.3 V regulator dropout plus
  * margin before the first flight - with no battery on the bus they are the
  * only thing keeping the MCU alive. */
+#ifndef USE_MPPT          /* guard: CI force-enables it from the command line */
 #define USE_MPPT
+#endif
 
 /* *** THE TRUE SENSE-CHAIN GAIN. ***
  * MILLIVOLT_PER_AMP above is deliberately mis-set to 13 (real value 136) so
