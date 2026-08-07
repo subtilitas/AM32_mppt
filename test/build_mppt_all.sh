@@ -33,11 +33,23 @@ while [ $# -gt 0 ]; do
     esac
 done
 
-command -v arm-none-eabi-gcc >/dev/null 2>&1 || {
-    if [ -d tools ]; then export PATH="$PATH:$(echo tools/*/bin | tr ' ' ':')"; fi
+# Locate arm-none-eabi-size (needed for the flash/RAM column; make itself uses
+# its own relative ARM_SDK_PREFIX and does not consult PATH).
+#
+# Do NOT guess the depth. `make arm_sdk_install` unpacks to
+#   tools/<os>/xpack-arm-none-eabi-gcc-<version>/bin
+# which is two levels under tools/, and an earlier version of this script
+# globbed tools/*/bin - one level. An unmatched glob stays literal in bash, so
+# PATH silently gained the string "tools/*/bin", the check below failed, and
+# the script exited 2 having built nothing. Search for the binary instead: the
+# version number is pinned in make/tools.mk and will eventually move.
+command -v arm-none-eabi-size >/dev/null 2>&1 || {
+    sdk=$(find tools -type f -name arm-none-eabi-size -perm -u+x 2>/dev/null | head -1)
+    [ -n "$sdk" ] && export PATH="$PATH:$(cd "$(dirname "$sdk")" && pwd)"
 }
 command -v arm-none-eabi-size >/dev/null 2>&1 || {
-    echo "ERROR: arm-none-eabi toolchain not on PATH. Run 'make arm_sdk_install'." >&2
+    echo "ERROR: arm-none-eabi toolchain not found under tools/ or on PATH." >&2
+    echo "       Run 'make arm_sdk_install' first." >&2
     exit 2
 }
 
@@ -51,6 +63,15 @@ fi
 [ -n "$MCU_FILTER" ] || ./test/mppt_targets.sh --report | sed -n '/^excluded/,$p' | sed 's/^/  /'
 echo
 
+# An empty list is a broken mppt_targets.sh or a typo'd --mcu, not a clean run.
+# Without this the loop below simply does not execute and the script exits 0,
+# which is indistinguishable from success right up until the release is empty.
+if [ "${#PAIRS[@]}" -eq 0 ]; then
+    echo "ERROR: no MPPT-eligible targets${MCU_FILTER:+ for MCU '$MCU_FILTER'}." >&2
+    echo "       Check ./test/mppt_targets.sh --report" >&2
+    exit 2
+fi
+
 # One make invocation per target: slower than `make all`, but it gives a
 # per-target verdict instead of stopping at the first broken board.
 mkdir -p obj
@@ -61,7 +82,7 @@ for pair in "${PAIRS[@]}"; do
     T=${pair%% *}; TRACKER=${pair##* }
     log=$(mktemp)
     CF="-DUSE_MPPT -DMPPT_TRACKER=MPPT_TRACKER_$TRACKER"
-    if make "$T" EXTRA_CFLAGS="$CF" "${EXTRA_MAKE_ARGS[@]}" >"$log" 2>&1; then
+    if make "$T" EXTRA_CFLAGS="$CF" ${EXTRA_MAKE_ARGS[@]+"${EXTRA_MAKE_ARGS[@]}"} >"$log" 2>&1; then
         elf=$(ls -t obj/AM32_"$T"_*.elf 2>/dev/null | head -1)
         if [ -n "$elf" ]; then
             read -r txt dat bss _ < <(arm-none-eabi-size "$elf" | tail -1)
@@ -80,8 +101,16 @@ for pair in "${PAIRS[@]}"; do
 done
 
 echo
-echo "built $pass, failed $fail"
+hex=$(ls obj/*.hex 2>/dev/null | wc -l)
+echo "built $pass, failed $fail, hex in obj/: $hex"
 if [ "$fail" -gt 0 ]; then
     printf 'failed targets:\n'; printf '  %s\n' "${failed[@]}"
     exit 1
+fi
+# The .hex is what CI uploads and what ends up in a release, but the loop above
+# only ever looks at the .elf. Say so out loud rather than handing the release
+# job an empty directory.
+if [ "$hex" -eq 0 ]; then
+    echo "ERROR: $pass targets built but obj/ contains no .hex - nothing to release." >&2
+    exit 3
 fi

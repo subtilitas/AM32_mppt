@@ -94,8 +94,16 @@ jobs:
       - name: Install ARM toolchain
         run: make arm_sdk_install
 
+      # pipefail is not optional here. The default shell is `bash -e`, but a
+      # pipeline's status is its LAST command, and tee always succeeds - so
+      # without this the step is green no matter what the script returns. That
+      # is exactly how v1.0 shipped: the toolchain was never found, the script
+      # exited 2 having compiled nothing, the job went green, and the release
+      # was published with zero binaries in it.
       - name: Build ${{ matrix.mcu }} with MPPT enabled
-        run: ./test/build_mppt_all.sh --mcu ${{ matrix.mcu }} -j4 | tee build_${{ matrix.mcu }}.txt
+        run: |
+          set -o pipefail
+          ./test/build_mppt_all.sh --mcu ${{ matrix.mcu }} -j4 | tee build_${{ matrix.mcu }}.txt
 
       - name: Summary
         if: always()
@@ -115,6 +123,8 @@ jobs:
             obj/*.hex
             build_${{ matrix.mcu }}.txt
           retention-days: 60
+          # warn, not error: on a failed build the .txt is the whole point of
+          # the upload and there will legitimately be no hex next to it.
           if-no-files-found: warn
 
   release:
@@ -137,10 +147,20 @@ jobs:
           merge-multiple: true
           path: release
 
+      - name: Refuse to publish an empty release
+        run: |
+          n=$(ls release/*.hex 2>/dev/null | wc -l)
+          echo "hex files collected: $n"
+          [ "$n" -gt 0 ] || { echo "::error::no .hex in any artifact"; exit 1; }
+          ls release/*.hex | sed 's/^/  /'
+
       - name: Publish
         uses: softprops/action-gh-release@v2
         with:
           files: release/*.hex
+          # belt and braces: the step above already checks, but this stops the
+          # action itself from cheerfully creating a release with no assets.
+          fail_on_unmatched_files: true
           body: |
             MPPT firmware. **Do not flash on a battery-powered ESC** - see the
             README. Every binary here regulates the input bus to a solar
