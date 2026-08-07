@@ -29,7 +29,13 @@ name: CI
 on:
   push:
     branches: ["**"]
-    tags: ['v[0-9]+.[0-9]+']
+    # GitHub filter patterns, not regex: [] is a class and + means "one or
+    # more of the preceding character". Both forms are listed because a
+    # pattern must match the WHOLE ref, so vN.N alone would silently ignore
+    # a vN.N.N tag - the workflow would run but never build a release.
+    tags:
+      - 'v[0-9]+.[0-9]+'
+      - 'v[0-9]+.[0-9]+.[0-9]+'
   pull_request:
   workflow_dispatch:
 
@@ -116,6 +122,14 @@ jobs:
     needs: build
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
+    # Declared explicitly: GitHub defaults the workflow token to read-only on
+    # newer repositories, and creating a release then fails with a 403 after
+    # the whole matrix has already built. Naming any permission drops the
+    # rest to none, so actions:read is listed too - download-artifact needs
+    # it to fetch the matrix jobs' uploads.
+    permissions:
+      contents: write
+      actions: read
     steps:
       - uses: actions/download-artifact@v4
         with:
