@@ -49,32 +49,62 @@ src = open('Inc/targets.h', encoding='utf-8', errors='replace').read()
 src = src.replace('\r\n', '\n').split('\n')
 
 # Walk #ifdef/#endif nesting and attribute each #define to its innermost block.
+# Every conditional must be PUSHED, not just the board blocks, because every
+# one of them is POPPED by its #endif. targets.h has 52 #ifndef guards, many
+# of them nested inside a board block; matching only `#ifdef NAME` meant the
+# guard's #endif closed the BOARD, and every define after it - including the
+# MILLIVOLT_PER_AMP that picks the tracker - was attributed to the wrong
+# scope. Blocks that are not a plain `#ifdef NAME` get a null name and fold
+# their defines back into the parent on close, which is what the preprocessor
+# effectively does for a board that guards a define with #ifndef.
+IFDEF = re.compile(r'\s*#\s*ifdef\s+([A-Za-z_]\w*)')
+ANYIF = re.compile(r'\s*#\s*if')
+ENDIF = re.compile(r'\s*#\s*endif')
+
 blocks, stack = {}, []
 for ln in src:
-    m = re.match(r'\s*#if(?:def)?\s+([A-Za-z_][A-Za-z0-9_]*)\s*$', ln)
-    if m:
-        stack.append([m.group(1), set(), None]); continue
-    if re.match(r'\s*#endif', ln):
+    if ENDIF.match(ln):
         if stack:
-            name, defs, fname = stack.pop()
-            e = blocks.setdefault(name, [set(), None])
-            e[0] |= defs
-            if fname: e[1] = fname
+            name, defs, fname, dis = stack.pop()
+            if name is not None:
+                e = blocks.setdefault(name, [set(), None, False])
+                e[0] |= defs
+                if fname: e[1] = fname; e[2] = dis
+            elif stack:
+                stack[-1][1] |= defs
+                if fname and stack[-1][2] is None:
+                    stack[-1][2] = fname; stack[-1][3] = dis
         continue
+    m = IFDEF.match(ln)
+    if m:
+        # trailing comments are common: `#ifdef SISKIN_11A_F051 // PB4 boot`
+        stack.append([m.group(1), set(), None, False]); continue
+    if ANYIF.match(ln):
+        stack.append([None, set(), None, False]); continue
     d = re.match(r'\s*#define\s+([A-Za-z_][A-Za-z0-9_]*)(.*)', ln)
     if d and stack:
         stack[-1][1].add(d.group(1))
         if d.group(1) == 'FILE_NAME':
             q = re.search(r'"([^"]+)"', d.group(2))
-            if q: stack[-1][2] = q.group(1)
+            if q:
+                stack[-1][2] = q.group(1)
+                # get_targets in make/tools.mk drops any FILE_NAME line
+                # carrying DISABLE_BUILD or //#, so `make <that target>`
+                # simply does not exist. Honour the same markers rather than
+                # maintaining a hand-written exclusion list here: upstream
+                # will disable more boards over time and this stays correct.
+                stack[-1][3] = ('DISABLE_BUILD' in ln) or ('//#' in ln)
 
 # The Makefile builds a target if its FILE_NAME contains _<MCU> (make/tools.mk
 # get_targets). Mirror that exactly so we never emit a name make cannot build.
 MCUS = ['E230','F031','F051','F415','F421','G071','L431','G431','V203','G031','A153']
 eligible, excluded = [], []
-for name, (defs, fname) in sorted(blocks.items()):
+for name, (defs, fname, disabled) in sorted(blocks.items()):
     if not fname:
         continue
+    if disabled:
+        excluded.append((fname, 'DISABLE_BUILD in targets.h - upstream does '
+                                'not build it either')); continue
     if not any('_'+m in fname for m in MCUS):
         excluded.append((fname, 'not a buildable make target')); continue
     if 'A153' in fname:
