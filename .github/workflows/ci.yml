@@ -121,6 +121,7 @@ jobs:
           name: AM32-MPPT-${{ matrix.mcu }}
           path: |
             obj/*.hex
+            obj/optnotes_*.txt
             build_${{ matrix.mcu }}.txt
           retention-days: 60
           # warn, not error: on a failed build the .txt is the whole point of
@@ -141,6 +142,10 @@ jobs:
       contents: write
       actions: read
     steps:
+      # needed for release_index.sh and the tracker assignment it reads out
+      # of Inc/targets.h; the matrix artifacts carry only build output.
+      - uses: actions/checkout@v4
+
       - uses: actions/download-artifact@v4
         with:
           pattern: AM32-MPPT-*
@@ -152,19 +157,33 @@ jobs:
           n=$(ls release/*.hex 2>/dev/null | wc -l)
           echo "hex files collected: $n"
           [ "$n" -gt 0 ] || { echo "::error::no .hex in any artifact"; exit 1; }
-          ls release/*.hex | sed 's/^/  /'
+
+      - name: Build the release notes
+        run: |
+          set -o pipefail
+          {
+            cat <<'HDR'
+          ## Solar MPPT firmware — do not flash on a battery ESC
+
+          Every binary here regulates the input bus to a solar panel's
+          maximum-power voltage and sheds throttle when the bus sags. On a
+          battery that behaviour is wrong in every direction. See the README.
+
+          HDR
+            ./test/release_index.sh release "$GITHUB_REPOSITORY" "$GITHUB_REF_NAME"
+          } > notes.md
+          wc -c notes.md
+          # GitHub rejects a release body over 125000 characters
+          [ "$(wc -c < notes.md)" -lt 120000 ] || {
+            echo "::error::release notes too long for GitHub"; exit 1; }
 
       - name: Publish
         uses: softprops/action-gh-release@v2
         with:
           files: release/*.hex
-          # belt and braces: the step above already checks, but this stops the
+          body_path: notes.md
+          # belt and braces: the check above already ran, but this stops the
           # action itself from cheerfully creating a release with no assets.
           fail_on_unmatched_files: true
-          body: |
-            MPPT firmware. **Do not flash on a battery-powered ESC** - see the
-            README. Every binary here regulates the input bus to a solar
-            panel's maximum-power voltage and will shed throttle when the bus
-            sags, which on a battery is wrong in every direction.
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -74,25 +74,62 @@ fi
 
 # One make invocation per target: slower than `make all`, but it gives a
 # per-target verdict instead of stopping at the first broken board.
+#
+# THE -Os RETRY
+#   AM32 compiles everything at -O3. On a 27 KB F051 that is the wrong trade
+#   the moment MPPT's ~3.4 kB lands on top, and F051 is 49 of the 247 targets.
+#   So a target that overflows flash is retried once at -Os -fdata-sections
+#   instead of being abandoned. -fdata-sections is worth having on its own:
+#   LDFLAGS already carries --gc-sections and CFLAGS already carries
+#   -ffunction-sections, so read-only data is the one thing never collected.
+#
+#   Only targets that actually overflow are retried, so this cannot change
+#   codegen on a board that already fit. Which boards needed it is recorded in
+#   obj/optnotes_*.txt and surfaced in the release notes - -Os is different
+#   codegen on timing-sensitive paths and those builds want bench validation.
 mkdir -p obj
-pass=0; fail=0; failed=()
-printf '%-34s %-5s %10s %10s\n' TARGET TRACK FLASH RAM
-printf '%-34s %-5s %10s %10s\n' "----------------------------------" "-----" "----------" "----------"
+SIZE_FALLBACK="-Os -fdata-sections"
+NOTES="obj/optnotes_${MCU_FILTER:-all}.txt"
+: > "$NOTES"
+
+pass=0; fail=0; shrunk=0; failed=()
+row='%-34s %-5s %-4s %10s %10s\n'
+printf "$row" TARGET TRACK OPT FLASH RAM
+printf "$row" "----------------------------------" "-----" "----" "----------" "----------"
 for pair in "${PAIRS[@]}"; do
     T=${pair%% *}; TRACKER=${pair##* }
     log=$(mktemp)
     CF="-DUSE_MPPT -DMPPT_TRACKER=MPPT_TRACKER_$TRACKER"
+    opt="-O3"; built=0
+
     if make "$T" EXTRA_CFLAGS="$CF" ${EXTRA_MAKE_ARGS[@]+"${EXTRA_MAKE_ARGS[@]}"} >"$log" 2>&1; then
-        elf=$(ls -t obj/AM32_"$T"_*.elf 2>/dev/null | head -1)
+        built=1
+    elif grep -qE "overflowed by|will not fit in region" "$log"; then
+        over=$(grep -oE "overflowed by [0-9]+ bytes" "$log" | head -1)
+        # a failed link can leave a partial .elf behind, and make would then
+        # consider the target up to date and never apply the new flags
+        rm -f obj/AM32_"$T"_[0-9]*.elf
+        if make "$T" EXTRA_CFLAGS="$CF $SIZE_FALLBACK" \
+                ${EXTRA_MAKE_ARGS[@]+"${EXTRA_MAKE_ARGS[@]}"} >"$log" 2>&1; then
+            built=1; opt="-Os"; shrunk=$((shrunk + 1))
+            echo "$T ${over:-overflowed flash} at -O3" >> "$NOTES"
+        fi
+    fi
+
+    if [ "$built" = 1 ]; then
+        # [0-9] anchors the version field. Without it AM32_TBS_12S_F415_*.elf
+        # also matches AM32_TBS_12S_F415_CAN_*.elf - there are 8 such sibling
+        # pairs, and the size column would report the wrong board.
+        elf=$(ls -t obj/AM32_"$T"_[0-9]*.elf 2>/dev/null | head -1)
         if [ -n "$elf" ]; then
             read -r txt dat bss _ < <(arm-none-eabi-size "$elf" | tail -1)
-            printf '%-34s %-5s %10s %10s\n' "$T" "$TRACKER" "$((txt + dat))" "$((dat + bss))"
+            printf "$row" "$T" "$TRACKER" "$opt" "$((txt + dat))" "$((dat + bss))"
         else
-            printf '%-34s %-5s %10s %10s\n' "$T" "$TRACKER" "ok" "-"
+            printf "$row" "$T" "$TRACKER" "$opt" "ok" "-"
         fi
         pass=$((pass + 1))
     else
-        printf '%-34s %-5s %10s\n' "$T" "$TRACKER" "FAIL"
+        printf '%-34s %-5s %-4s %10s\n' "$T" "$TRACKER" "-" "FAIL"
         # surface the useful line: overflow, missing define, failed assertion
         grep -m3 -E "overflowed|region .* overflow|error:|static assertion" "$log" | sed 's/^/      /'
         failed+=("$T"); fail=$((fail + 1))
@@ -102,7 +139,10 @@ done
 
 echo
 hex=$(ls obj/*.hex 2>/dev/null | wc -l)
-echo "built $pass, failed $fail, hex in obj/: $hex"
+echo "built $pass ($shrunk needed -Os), failed $fail, hex in obj/: $hex"
+if [ "$shrunk" -gt 0 ]; then
+    echo "rebuilt at -Os to fit:"; sed 's/^/  /' "$NOTES"
+fi
 if [ "$fail" -gt 0 ]; then
     printf 'failed targets:\n'; printf '  %s\n' "${failed[@]}"
     exit 1
