@@ -589,8 +589,35 @@ These are **not** fixed. They need hardware, not more simulation.
    The crossover is where current falls under two ADC counts. β then falls
    back to fixed-k, which costs ~10%. The rpm tracker keeps working down
    there because it never needed current at all — at the price of the
-   ±0.21 V dither. Using the rpm tracker as the low-light fallback instead
-   of fixed-k is the obvious improvement and is not implemented.
+   ±0.21 V dither.
+
+   **Now implemented** as `MPPT_BETA_RPM_FALLBACK`, default on. When
+   `beta_valid` goes to 0 a β build runs `mppt_rpm_track()` in that tick
+   instead of coasting on a held trim. The two compose rather than compete:
+   rpm perturbs `k_focv_q8`, β trims `beta_trim`, and `mppt_focv_seed()` is
+   their sum, so β's learned trim survives the handover untouched and rpm's
+   learned `k` survives the return. Only one runs per tick.
+
+   Re-measured on the 12-cell SunPower plant, 60 s:
+
+   | irradiance | β alone | β + rpm fallback | rpm alone |
+   |---|---|---|---|
+   | 100% | 99.98% | 99.98% | 99.82% |
+   | 35% | 99.78% | 99.78% | 99.69% |
+   | 20% | 98.23% | **99.52%** | 99.40% |
+   | 15% | 96.96% | **99.17%** | 98.86% |
+   | 10% | 94.46% | 97.17% | **98.72%** |
+   | 7% | 91.96% | **96.57%** | 96.57% |
+
+   Identical above 20% — the fallback simply never fires there, which is the
+   property worth having. Below it, worth 1.3 to 4.6 points. At 10% the
+   hybrid is 1.6 points *behind* pure rpm, because β's held trim is stale by
+   then and only `k` is being corrected; that is the cost of keeping β's
+   learning rather than discarding it, and it is still 2.7 points ahead of
+   doing nothing.
+
+   Costs ~390 bytes. On a part with no room, `build_mppt_all.sh` drops the
+   fallback before it drops the board — that is the `-Os!` column.
 
 7. **Right shifts of negative values.** The IIR filters rely on `>>` being
    arithmetic, which GCC guarantees but ISO C does not. It also biases the

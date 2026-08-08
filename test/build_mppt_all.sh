@@ -87,8 +87,13 @@ fi
 #   codegen on a board that already fit. Which boards needed it is recorded in
 #   obj/optnotes_*.txt and surfaced in the release notes - -Os is different
 #   codegen on timing-sensitive paths and those builds want bench validation.
+#   Two tiers, tried in order. The second also drops the rpm fallback that a
+#   beta build carries for low light - that is a few hundred bytes of tracker
+#   code which only earns its keep below ~20% irradiance, so it is the right
+#   thing to lose last rather than the whole board.
 mkdir -p obj
-SIZE_FALLBACK="-Os -fdata-sections"
+SIZE_TIERS=("-Os -fdata-sections"
+            "-Os -fdata-sections -DMPPT_BETA_RPM_FALLBACK=0")
 NOTES="obj/optnotes_${MCU_FILTER:-all}.txt"
 : > "$NOTES"
 
@@ -106,14 +111,23 @@ for pair in "${PAIRS[@]}"; do
         built=1
     elif grep -qE "overflowed by|will not fit in region" "$log"; then
         over=$(grep -oE "overflowed by [0-9]+ bytes" "$log" | head -1)
-        # a failed link can leave a partial .elf behind, and make would then
-        # consider the target up to date and never apply the new flags
-        rm -f obj/AM32_"$T"_[0-9]*.elf
-        if make "$T" EXTRA_CFLAGS="$CF $SIZE_FALLBACK" \
-                ${EXTRA_MAKE_ARGS[@]+"${EXTRA_MAKE_ARGS[@]}"} >"$log" 2>&1; then
-            built=1; opt="-Os"; shrunk=$((shrunk + 1))
-            echo "$T ${over:-overflowed flash} at -O3" >> "$NOTES"
-        fi
+        tier=0
+        for extra in "${SIZE_TIERS[@]}"; do
+            tier=$((tier + 1))
+            # a failed link can leave a partial .elf behind, and make would
+            # then consider the target up to date and never apply the new flags
+            rm -f obj/AM32_"$T"_[0-9]*.elf
+            if make "$T" EXTRA_CFLAGS="$CF $extra" \
+                    ${EXTRA_MAKE_ARGS[@]+"${EXTRA_MAKE_ARGS[@]}"} >"$log" 2>&1; then
+                built=1; shrunk=$((shrunk + 1))
+                if [ "$tier" = 1 ]; then opt="-Os"
+                else                     opt="-Os!"; fi
+                echo "$T ${over:-overflowed flash} at -O3, built with $(
+                     echo "$extra" | sed 's/-fdata-sections//;s/  */ /g;s/ $//'
+                     )" >> "$NOTES"
+                break
+            fi
+        done
     fi
 
     if [ "$built" = 1 ]; then

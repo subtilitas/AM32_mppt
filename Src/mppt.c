@@ -307,7 +307,7 @@ void mppt_init(void)
     mppt.duty_applied   = 0;
     mppt.coasting       = 0;
     mppt.coast_events   = 0;
-    mppt.collapse_events = 0;
+    mppt.collapse_events = 0;
 
     recover_ok_ticks = 0;
     seed_ticks       = 0;
@@ -355,7 +355,7 @@ void mppt_init(void)
  * have authority - if duty is railed, vref is not setting the operating
  * point and the rpm tells us nothing about k.
  */
-#if MPPT_TRACKER == MPPT_TRACKER_RPM
+#if MPPT_TRACKER == MPPT_TRACKER_RPM || MPPT_BETA_RPM_FALLBACK
 static void mppt_rpm_track(uint8_t regulating)
 {
     int32_t ect = (int32_t)e_com_time;
@@ -427,7 +427,7 @@ static void mppt_rpm_track(uint8_t regulating)
     mppt.rpm_ticks     = 0;
     mppt.rpm_input_ref = in_now;
 }
-#endif /* MPPT_TRACKER_RPM */
+#endif /* MPPT_TRACKER_RPM || MPPT_BETA_RPM_FALLBACK */
 
 #if MPPT_TRACKER == MPPT_TRACKER_BETA
 /* --------------------------------------------------------------------- */
@@ -782,6 +782,21 @@ void mppt_1khz_update(void)
             if (reg_ticks >= MPPT_REG_TICKS) mppt_beta_update();
             else                             mppt.beta_valid = 0;
         }
+#if MPPT_BETA_RPM_FALLBACK
+        /* Below roughly 20% irradiance the array current drops under
+         * MPPT_BETA_I_MIN, beta_valid goes to 0 and the regulator holds its
+         * trim - correct, but it then tracks nothing at all while the light
+         * keeps changing. The rpm tracker needs no current, so hand over.
+         *
+         * The two compose rather than compete: rpm perturbs k_focv_q8, beta
+         * trims beta_trim, and mppt_focv_seed() is their sum. Only one runs
+         * per tick, and beta_trim is held untouched through the handover, so
+         * whatever beta learned in good light is still there when it returns.
+         * Whatever rpm learned about k stays too - k is a property of the
+         * panel, not of the light level. */
+        if (!mppt.beta_valid)
+            mppt_rpm_track((uint8_t)(reg_ticks >= MPPT_REG_TICKS));
+#endif
 #else
         /* Fallback for boards with no usable current sense: perturb k and
          * keep whichever direction raises rpm. Dithers by construction -

@@ -486,6 +486,16 @@ _Static_assert(MPPT_COAST_EXIT_DUTY > MPPT_COAST_DUTY_TH,
 #define MPPT_BETA_MPP_DERIVED        1
 #endif
 
+/* Hand beta's window over to the rpm tracker when the current channel stops
+ * carrying information (beta_valid == 0, i.e. below MPPT_BETA_I_MIN, roughly
+ * 20% irradiance). Costs a few hundred bytes of flash in a beta build for the
+ * rpm tracker's code, and is worth 1.2 to 4.6 points of tracking efficiency in
+ * the light where beta has nothing to work with. Set to 0 on a part that
+ * cannot spare the flash - build_mppt_all.sh does that automatically. */
+#ifndef MPPT_BETA_RPM_FALLBACK
+#define MPPT_BETA_RPM_FALLBACK       1
+#endif
+
 /* Impp/Isc for a high-fill-factor back-contact cell. */
 #ifndef MPPT_IMPP_FRAC_Q8
 #define MPPT_IMPP_FRAC_Q8          243    /* 0.95 */

@@ -73,6 +73,9 @@ jobs:
       - name: Bus collapse path
         run: EXTRA="-DSHADE_AT=5.0 -DSHADE_G=0.001" ./test/mppt_sim/run.sh 8
 
+      - name: Hand-written externs match their definitions
+        run: ./test/check_externs.sh
+
       - name: Tracker assignment per board
         run: ./test/mppt_targets.sh --report
 
