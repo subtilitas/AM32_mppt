@@ -5,6 +5,7 @@
 #   ./mppt_targets.sh --beta     # only the beta-capable targets
 #   ./mppt_targets.sh --rpm      # only the rpm-fallback targets
 #   ./mppt_targets.sh --report   # both lists plus exclusions, with reasons
+#   ./mppt_targets.sh --excluded # "TARGET<tab>reason" for every board dropped
 #   ./mppt_targets.sh --mcu F051 # only that MCU family (used by CI's matrix)
 #
 # THE SELECTION RULE, AND WHY IT IS NOT "ALL TARGETS"
@@ -34,13 +35,16 @@
 # current sensing" flag.
 #
 # Also excluded: NXP MCXA parts, whose 16-bit ADC needs different current
-# staging that mppt.h refuses outright rather than mis-scale by 16x.
+# staging that mppt.h refuses outright rather than mis-scale by 16x; and
+# 4-in-1 / AIO boards, where four ESCs run four independent trackers against
+# one shared solar bus and read each other's perturbations as their own.
 set -e
 cd "$(dirname "$0")/.."
 
 python3 - "$@" <<'PY'
 import re, sys
 report = '--report' in sys.argv
+show_excl = '--excluded' in sys.argv
 only   = 'beta' if '--beta' in sys.argv else ('rpm' if '--rpm' in sys.argv else None)
 mcu    = None
 if '--mcu' in sys.argv:
@@ -98,6 +102,18 @@ for ln in src:
 # The Makefile builds a target if its FILE_NAME contains _<MCU> (make/tools.mk
 # get_targets). Mirror that exactly so we never emit a name make cannot build.
 MCUS = ['E230','F031','F051','F415','F421','G071','L431','G431','V203','G031','A153']
+
+# Four-output hardware. Each of the four ESCs on a 4-in-1 runs its own copy of
+# this firmware with its own tracker, and they all share one solar bus - so
+# they perturb the same node and read each other's perturbations as their own
+# result. AIO is the same hardware with a flight controller attached.
+#
+# Matched on FILE_NAME only. FIRMWARE_NAME is not usable for this: upstream has
+# ORQA_F421 branded "TBSlu6s4in1", FLIPSKY_F421 branded "MAXKGO_4IN1" and
+# GIPSY_F421 branded "Tekko32 4in1", which are copy-paste artefacts and say
+# nothing about the board.
+MULTI = re.compile(r'(^|_)(4IN1|AIO)(_|$)', re.I)
+
 eligible, excluded = [], []
 for name, (defs, fname, disabled) in sorted(blocks.items()):
     if not fname:
@@ -109,6 +125,9 @@ for name, (defs, fname, disabled) in sorted(blocks.items()):
         excluded.append((fname, 'not a buildable make target')); continue
     if 'A153' in fname:
         excluded.append((fname, 'NXP MCXA - 16-bit ADC, current staging unsupported')); continue
+    if MULTI.search(fname):
+        excluded.append((fname, '4-in-1: four independent MPPT regulators on '
+                                'one shared solar bus')); continue
     if mcu and ('_' + mcu) not in fname:
         continue
     tracker = 'BETA' if 'MILLIVOLT_PER_AMP' in defs else 'RPM'
@@ -127,6 +146,8 @@ if report:
     for t, r in excluded: reasons.setdefault(r, []).append(t)
     for r, ts in sorted(reasons.items(), key=lambda x: -len(x[1])):
         print(f"    {len(ts):3d}  {r}")
+elif show_excl:
+    for t, r in sorted(excluded): print(f"{t}\t{r}")
 elif only == 'beta':
     for t in beta: print(t)
 elif only == 'rpm':

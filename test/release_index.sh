@@ -100,5 +100,29 @@ if shrunk:
         out.append(f'- `{t}` — {shrunk[t]}')
     out.append('')
 
+# "where is my board?" answered here rather than left as a silent absence.
+# The junk-name reason is skipped: those entries are not real boards.
+exc = subprocess.run(['./test/mppt_targets.sh', '--excluded'],
+                     capture_output=True, text=True, check=True).stdout
+dropped = {}
+for line in exc.split('\n'):
+    if '\t' in line:
+        t, r = line.split('\t', 1)
+        if r != 'not a buildable make target':
+            dropped.setdefault(r, []).append(t)
+
+if dropped:
+    out.append('## Boards deliberately not built')
+    out.append('')
+    for reason in sorted(dropped, key=lambda r: -len(dropped[r])):
+        ts = sorted(dropped[reason])
+        out.append(f'<details><summary>{reason} &nbsp; ({len(ts)})</summary>')
+        out.append('')
+        for t in ts:
+            out.append(f'- `{t}`')
+        out.append('')
+        out.append('</details>')
+        out.append('')
+
 print('\n'.join(out))
 PY
