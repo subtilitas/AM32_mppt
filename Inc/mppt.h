@@ -112,7 +112,7 @@
  * not SunPower.
  * ------------------------------------------------------------------- */
 #ifndef MPPT_CELLS
-#define MPPT_CELLS                  14    /* series cells in the array */
+#define MPPT_CELLS                  12    /* series cells in the array */
 #endif
 #ifndef MPPT_CELL_VOC_MV
 #define MPPT_CELL_VOC_MV           710
@@ -893,11 +893,25 @@ rather than silently mis-scaled by 16x."
 #define MPPT_I_LSB_Q8 \
     ((MPPT_ADC_VREF_MV * 256) / (MPPT_I_SCALE_DIV * MPPT_MILLIVOLT_PER_AMP))
 
-/* Array nameplate short-circuit current at STC, in 10 mA units. This is
- * the reference every current-domain threshold is checked against - it is
- * what tells the module whether its own measurements mean anything. */
+/* Array nameplate current at STC, in 10 mA units.
+ *
+ * Impp is the knob because it is the number people have: cell vendors and
+ * panel datasheets quote the maximum power point, and on a wing you size
+ * the array by the current you want at the MPP, not by what it does into a
+ * short. Isc follows from the fill factor above and remains the reference
+ * every current-domain threshold is checked against - it is what tells the
+ * module whether its own measurements mean anything.
+ *
+ * Define MPPT_ARRAY_ISC directly to override if Isc is what you measured;
+ * the board block on EGAN_JUWI_L431 does exactly that for a 120 mA bench
+ * panel. Defining either one alone is enough. */
+#ifndef MPPT_ARRAY_IMPP
+#define MPPT_ARRAY_IMPP            600    /* 6.00 A at the maximum power point */
+#endif
+
 #ifndef MPPT_ARRAY_ISC
-#define MPPT_ARRAY_ISC             300    /* 3.00 A */
+#define MPPT_ARRAY_ISC \
+    (((int32_t)MPPT_ARRAY_IMPP << 8) / MPPT_IMPP_FRAC_Q8)
 #endif
 
 /* How many ADC counts the whole array spans. Below ~40 the current channel
