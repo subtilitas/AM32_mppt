@@ -323,7 +323,12 @@
 #define MPPT_ERR_CLAMP            1000
 #endif
 
-/* Integrator clamp, in AM32 duty units. */
+/* Integrator bounds, in AM32 duty units. The LIVE clamp in mppt.c is the
+ * active output ceiling (2000, or MPPT_STARTUP_DUTY_MAX during spin-up) -
+ * see the anti-windup note in mppt_pi_update(). MPPT_I_TERM_MAX is not
+ * applied to the controller directly; it only feeds the int32-overflow
+ * static assert at the bottom of this file, which sizes the worst-case
+ * RECOVER decay multiply. */
 #define MPPT_I_TERM_MAX           2000
 #define MPPT_I_TERM_MIN              0
 
@@ -532,59 +537,6 @@ _Static_assert(MPPT_COAST_EXIT_DUTY > MPPT_COAST_DUTY_TH,
 #endif
 
 /* ===================================================================== */
-/*
- * WHY RPM AND NOT PANEL POWER
- *
- * Fractional-Voc is open-loop on a constant. It cannot find the peak; it
- * can only sit where MPPT_K_FOCV_Q8 says the peak ought to be. That is
- * fine until the constant is wrong, and on a real panel it usually is.
- *
- * The obvious fix is to hill-climb on measured power, and on this hardware
- * that does not work: a 120 mA array spans 20 ADC counts of current, so
- * dP is mostly quantisation. But the ESC has a
- * far better signal sitting unused. e_com_time is the electrical
- * revolution period in microseconds, so at 44-47 krpm one LSB is about
- * 0.5% of speed - ten times finer than one current count - and it can be
- * averaged over hundreds of revolutions.
- *
- * For a fixed-pitch prop the load torque goes as w^2, so shaft power goes
- * as w^3 and maximum rpm IS maximum shaft power. Two consequences worth
- * being explicit about:
- *
- *   - It is not merely a proxy for panel power. On an aircraft, thrust is
- *     the actual objective, and maximising rpm also absorbs variation in
- *     motor efficiency - which panel-power MPPT ignores by construction.
- *   - The 6.8% speed difference between 44 and 47 krpm is ~22% of shaft
- *     power. Small rpm errors are not small power errors.
- *
- * WHAT IS ADAPTED
- *
- * The ratio k, not a voltage offset. The FOCV error is (k_true - k0)*Voc,
- * which scales with Voc, so correcting k stays right as irradiance and
- * temperature move Voc around; a fixed voltage trim would not.
- *
- * The inner PI still regulates fast to whatever setpoint k produces. Only
- * k moves slowly, which is the whole point: perturbations have to outlast
- * the propeller's 0.5-2 s mechanical time constant before the rpm they
- * cause means anything.
- *
- * k is NOT written to EEPROM. It re-learns from MPPT_K_FOCV_Q8 within
- * ~10 s of steady throttle each flight.
- */
-
-/* ---------------------------------------------------------------------
- * MANOEUVRE NOTE (aircraft-specific)
- *
- * ONE HARDWARE POINT, worth more than any firmware: wire the port and
- * starboard arrays in PARALLEL, not in series. In series, wing dihedral
- * makes one string weaker in a bank, its bypass diode conducts, and the
- * P-V curve grows a second local peak. beta assumes a single-peaked curve
- * - as does every simple tracker - and will happily regulate to the wrong
- * one. In parallel the currents just add and the curve stays
- * single-peaked.
- * ------------------------------------------------------------------- */
-
-/* ===================================================================== */
 /*  6b. TRACKER SELECTION                                                */
 /* ===================================================================== */
 /*
@@ -632,7 +584,7 @@ _Static_assert(MPPT_COAST_EXIT_DUTY > MPPT_COAST_DUTY_TH,
  *
  * The obvious fix is to hill-climb on measured power, and on this hardware
  * that does not work: a 120 mA array spans 20 ADC counts of current, so
- * dP is mostly quantisation (see MPPT_DP_QUANT_MULT). But the ESC has a
+ * dP is mostly quantisation. But the ESC has a
  * far better signal sitting unused. e_com_time is the electrical
  * revolution period in microseconds, so at 44-47 krpm one LSB is about
  * 0.5% of speed - ten times finer than one current count - and it can be
@@ -667,8 +619,7 @@ _Static_assert(MPPT_COAST_EXIT_DUTY > MPPT_COAST_DUTY_TH,
 
 /* Settling allowance after each perturbation, before rpm is believed.
  * MUST exceed the prop's mechanical time constant or the tracker measures
- * its own transient and wanders - the same trap as MPPT_PERIOD_TICKS in
- * the power-domain tracker, but three orders of magnitude slower. */
+ * its own transient and wanders. */
 #ifndef MPPT_RPM_SETTLE_MS
 #define MPPT_RPM_SETTLE_MS         400
 #endif
@@ -734,10 +685,11 @@ _Static_assert(MPPT_COAST_EXIT_DUTY > MPPT_COAST_DUTY_TH,
  * 5 ms tracker period, so ordinary hill-climbing rides it without ever
  * tripping the transient detector. Nothing extra is needed for it.
  *
- * The genuinely fast events are cloud edges and fuselage/prop shadow,
- * which is exactly what MPPT_I_TRANSIENT_PCT and MPPT_I_RESEED_PCT above
- * are for: hold direction on a moderate step, jump to the fractional-Voc
- * estimate on a big one.
+ * The genuinely fast events are cloud edges and fuselage/prop shadow.
+ * Those are handled by the safety paths, not the tracker: a big enough
+ * drop pulls the bus under MPPT_V_COLLAPSE and the state machine falls
+ * into RECOVER, then re-seeds vref from the fractional-Voc estimate on
+ * the way back.
  *
  * ONE HARDWARE POINT, worth more than any firmware: wire the port and
  * starboard arrays in PARALLEL, not in series. In series, wing dihedral
@@ -947,6 +899,12 @@ _Static_assert(MPPT_V_COLLAPSE + MPPT_V_COLLAPSE_HYST
     "collapse threshold leaves no usable vref band below Voc");
 _Static_assert((MPPT_VOC_NOMINAL * MPPT_K_FOCV_Q8 >> 8) > MPPT_V_COLLAPSE,
     "fractional-Voc seed sits below the collapse threshold");
+/* The rpm tracker clamps k to [MPPT_K_MIN_Q8, MPPT_K_MAX_Q8]. A seed
+ * outside that band (possible if a board block overrides the per-cell
+ * voltages) would jump to the rail on the first track decision. */
+_Static_assert(MPPT_K_FOCV_Q8 >= MPPT_K_MIN_Q8
+                   && MPPT_K_FOCV_Q8 <= MPPT_K_MAX_Q8,
+    "MPPT_K_FOCV_Q8 seed is outside the rpm tracker's clamp band");
 _Static_assert(MPPT_TICK_HZ >= 500,
     "control tick below 500 Hz - the PI gains and deadbands do not hold");
 _Static_assert(MPPT_RECOVER_OK_TICKS >= 1 && MPPT_RECOVER_TICKS >= 1,

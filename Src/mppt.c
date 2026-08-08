@@ -100,8 +100,6 @@ static uint8_t  reg_ticks;
 /* Small helpers                                                          */
 /* --------------------------------------------------------------------- */
 
-static inline int32_t iabs32(int32_t x) { return (x < 0) ? -x : x; }
-
 /* Enter or leave the coasting (all FETs floated) state. See the long note in
  * mppt.h - on this hardware duty 0 is a brake, not a coast. */
 static inline void mppt_coast(uint8_t on)
@@ -623,7 +621,6 @@ void mppt_1khz_update(void)
                     /* Real Voc now, so the beta target can stop guessing. */
                     mppt_beta_target();
 #endif
-                    mppt.i_q8          = mppt.i << 8;
                 }
                 mppt.quiet_ticks = 0;
             }
