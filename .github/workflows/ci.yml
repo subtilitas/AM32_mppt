@@ -115,14 +115,31 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
+      # Stage everything into one flat directory FIRST, and upload that
+      # directory rather than a list of patterns.
+      #
+      # upload-artifact roots the archive at the least common ancestor of all
+      # its path patterns. Listing obj/*.hex alongside a top-level
+      # build_<MCU>.txt makes that ancestor the workspace root, so the hex go
+      # into the artifact as obj/AM32_*.hex and download-artifact unpacks them
+      # to release/obj/ - where `ls release/*.hex` finds nothing. Uploading a
+      # single directory makes the artifact root that directory, which is
+      # stable no matter what the file list grows into.
+      - name: Stage artifacts
+        if: always()
+        run: |
+          mkdir -p upload
+          cp obj/*.hex             upload/ 2>/dev/null || true
+          cp obj/optnotes_*.txt    upload/ 2>/dev/null || true
+          cp build_${{ matrix.mcu }}.txt upload/ 2>/dev/null || true
+          ls -1 upload | sed -n '1,5p'
+          echo "staged: $(ls -1 upload | wc -l) files"
+
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: AM32-MPPT-${{ matrix.mcu }}
-          path: |
-            obj/*.hex
-            obj/optnotes_*.txt
-            build_${{ matrix.mcu }}.txt
+          path: upload/
           retention-days: 60
           # warn, not error: on a failed build the .txt is the whole point of
           # the upload and there will legitimately be no hex next to it.
@@ -152,11 +169,19 @@ jobs:
           merge-multiple: true
           path: release
 
-      - name: Refuse to publish an empty release
+      - name: Flatten, then refuse to publish an empty release
         run: |
+          # Belt and braces against the artifact-layout trap above: whatever
+          # nesting the upload side produces, end up with a flat release/.
+          find release -mindepth 2 -name '*.hex' -exec mv -f -t release/ {} +
+          find release -mindepth 2 -name '*.txt' -exec mv -f -t release/ {} +
+          find release -mindepth 1 -type d -empty -delete
           n=$(ls release/*.hex 2>/dev/null | wc -l)
           echo "hex files collected: $n"
-          [ "$n" -gt 0 ] || { echo "::error::no .hex in any artifact"; exit 1; }
+          [ "$n" -gt 0 ] || {
+            echo "::error::no .hex in any artifact"
+            echo "what was actually downloaded:"; find release | head -40
+            exit 1; }
 
       - name: Build the release notes
         run: |
