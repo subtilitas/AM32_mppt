@@ -227,6 +227,7 @@ an settings option)
 #include "phaseouts.h"
 #include "serial_telemetry.h"
 #include "kiss_telemetry.h"
+#include "jeti_ex_telemetry.h"
 #include "signal.h"
 #include "sounds.h"
 #include "targets.h"
@@ -2128,14 +2129,21 @@ if(zero_crosses < 5){
 #endif
         if (send_telemetry) {
 #ifdef USE_SERIAL_TELEMETRY
+#ifdef USE_JETI_EX_TELEMETRY
+            send_telem_DMA(makeJetiTelemPackage((int8_t)degrees_celsius, battery_voltage,
+                actual_current, (uint16_t)(consumed_current >> 16), e_rpm));
+#else
             makeTelemPackage((int8_t)degrees_celsius, battery_voltage, actual_current,
                 (uint16_t)(consumed_current >> 16), e_rpm);
             send_telem_DMA(10);
+#endif
             send_telemetry = 0;
 #endif
         } else if(send_esc_info_flag ) {
+#ifndef USE_JETI_EX_TELEMETRY
            makeInfoPacket();
            send_telem_DMA(49);
+#endif
            send_esc_info_flag = 0;
         }
         if (PROCESS_ADC_FLAG == 1) { // for adc and telemetry set adc counter at 1khz loop rate

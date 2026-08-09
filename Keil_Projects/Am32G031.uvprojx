@@ -483,6 +483,11 @@
               <FileType>1</FileType>
               <FilePath>..\Src\kiss_telemetry.c</FilePath>
             </File>
+            <File>
+              <FileName>jeti_ex_telemetry.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Src\jeti_ex_telemetry.c</FilePath>
+            </File>
           </Files>
         </Group>
         <Group>

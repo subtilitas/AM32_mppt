@@ -133,6 +133,7 @@ AM32 has the following features:
 - Servo PWM, Dshot(300, 600) motor protocol support
 - Bi-directional Dshot
 - KISS standard ESC telemetry
+- Jeti Ex telemetry (define USE_JETI_EX_TELEMETRY in targets.h for the target)
 - Variable PWM frequency
 - Sinusoidal startup mode, which is designed to get larger motors up to speed
 ### Build instructions
