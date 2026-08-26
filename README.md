@@ -219,3 +219,6 @@ Voodoobrew
 
 (and many more)
 
+---
+
+In collaboration with Claude Code.
